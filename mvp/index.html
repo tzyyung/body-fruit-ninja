@@ -416,6 +416,8 @@
   const bases  = { left: [], right: [] };   // 刀柄（手腕）軌跡
   const prev   = { left: null, right: null };
   const joint  = {};            // 關節名 → { x, y, t, heldSince }
+  // 每一側上一次被信任的鏈，用來判斷延續性
+  const chainHist = { left: null, right: null };
   const boneMed = {};           // 骨頭名 → 長度中位數用的樣本
   let stats = freshStats();
 
@@ -604,14 +606,46 @@
     return true;
   }
 
-  // 哪一邊的證據比較強：三個關節分數相加
-  function armScore(side, kp) {
+  // 這一側的三個關節，跟它自己上一次被信任的位置有多接近。
+  // 回傳 0..1，1 代表完全沒動，0 代表接不上（或根本沒有歷史）。
+  function continuity(side, kp, now) {
+    const h = chainHist[side];
+    if (!h || now - h.t > CHAIN_MEM_MS) return 0;
+    const scale = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
+    // 允許的位移隨經過時間放大，掉幀時才不會誤判成接不上
+    const budget = scale * CHAIN_MOVE * Math.max(1, (now - h.t) / 33);
+    let worst = 0;
+    for (const part of ARM) {
+      const k = kp[side + '_' + part], p = h[part];
+      if (!k || !p) return 0;
+      worst = Math.max(worst, Math.hypot(k.x - p.x, k.y - p.y));
+    }
+    return Math.max(0, 1 - worst / budget);
+  }
+
+  function rememberChain(side, kp, now) {
+    const rec = { t: now };
+    for (const part of ARM) {
+      const k = kp[side + '_' + part];
+      if (!k) { chainHist[side] = null; return; }
+      rec[part] = { x: k.x, y: k.y };
+    }
+    chainHist[side] = rec;
+  }
+
+  // 哪一邊的證據比較強。
+  //
+  // 不能只比分數：手往前伸時那隻真手的信心會因為投影而下降，
+  // 模型猜的幽靈手分數可能還比較高 —— 只比分數會把真手丟掉。
+  // 連續性是更可靠的證據：真手是連續動作的產物，幽靈手不是。
+  function armScore(side, kp, now) {
     let t = 0;
     for (const part of ARM) {
       const k = kp[side + '_' + part];
       t += k ? k.score : 0;
     }
-    return t;
+    // 連續性最多可以抵過 1.5 分的信心差距
+    return t + continuity(side, kp, now) * 1.5;
   }
 
   // 兩肩都看得到才有肩寬可用；只看得到一邊就回 0，那道檢查自動略過
@@ -656,7 +690,7 @@
     return true;
   }
 
-  function bladeFor(side, kp) {
+  function bladeFor(side, kp, now) {
     if (ui.stable.checked && !armVisible(side, kp)) return null;
     const mirror = (k) => ({ x: cv.width - k.x, y: k.y, score: k.score });
     const get = (n) => {
@@ -680,7 +714,12 @@
       // 很可能把這隻手的手腕配上另一邊的肩膀，算出一條橫跨身體的方向。
       // 錯的方向比沒有方向糟糕得多：沒方向只是少 10cm 偏移，
       // 錯方向會讓刀刃指到完全不相干的位置。
-      if (eb && sh && chainOK(sh, eb, wrist, shoulderWidth(kp))) {
+      // 幾何過不了但接得上自己上一幀的鏈 → 仍然可信。
+      // 手往前伸是連續動作，中途某幾幀的幾何可能剛好落在邊界外，
+      // 不該因此整條鏈作廢。
+      const geoOK = eb && sh && chainOK(sh, eb, wrist, shoulderWidth(kp));
+      const contOK = eb && sh && continuity(side, kp, now) > 0.25;
+      if (geoOK || contOK) {
         const foreLen = Math.hypot(wrist.x - eb.x, wrist.y - eb.y);
         stats.forearm = Math.max(stats.forearm, foreLen);
 
@@ -698,6 +737,7 @@
         const off = foreLen * K;
         const x = wrist.x + (wrist.x - ax) / len * off;
         const y = wrist.y + (wrist.y - ay) / len * off;
+        rememberChain(side, kp, now);
         return { bx:x, by:y, tx:x, ty:y, pad: px(PALM_PAD) };
       }
       // 鏈不成立 → 沒有刀。不做「退化成手腕單點」。
@@ -708,6 +748,7 @@
       // 一隻手就長出兩把刀。位置錯的刀比沒有刀糟得多：
       // 會誤砍炸彈、斷連擊、讓整個遊戲看起來是隨機的。
       stats.chainBroken++;
+      chainHist[side] = null;
       return null;
     }
     if (mode === 'wrist') {
@@ -1558,6 +1599,12 @@
   // —— 改用肩膀→手腕，同一條已驗證的鏈，基線長得多也穩得多
   const DIR_MIN_FOREARM = 0.3;
 
+  // 手臂不會瞬移，也不會憑空出現。一條鏈該不該信，除了看它自己的幾何，
+  // 還要看它是不是上一幀的延續 —— 真手是連續動作的產物，
+  // 模型猜出來的幽靈手不是。
+  const CHAIN_MEM_MS = 700;    // 記得多久以前的鏈
+  const CHAIN_MOVE = 0.55;     // 每 33ms 每個關節最多移動幾倍前臂長
+
   // ── 校正 ──
   // 原本所有門檻都是用「畫面寬的比例」表示的，那已經比寫死像素好，
   // 但畫面寬跟「這個人的手臂有多長」沒有關係 —— 站遠一點、手臂短一點，
@@ -1854,12 +1901,14 @@
     // 兩邊的點重疊時，弱的那一邊直接從 kp 裡拿掉 ——
     // 不能只是「不給它刀」，要讓它完全沒機會沾到另一邊的點。
     if (!armsDistinct(kp)) {
-      const weak = armScore('left', kp) >= armScore('right', kp) ? 'right' : 'left';
+      const weak = armScore('left', kp, now) >= armScore('right', kp, now)
+        ? 'right' : 'left';
       for (const part of ARM) delete kp[weak + '_' + part];
+      chainHist[weak] = null;
       stats.lrRejects++;
     }
 
-    const blades = { left: bladeFor('left', kp), right: bladeFor('right', kp) };
+    const blades = { left: bladeFor('left', kp, now), right: bladeFor('right', kp, now) };
 
     // 左右手混淆保護：模型在雙手交叉或重疊時會把左右互換，
     // 那會產生一條橫跨畫面的假刀痕、憑空切掉一排水果。
