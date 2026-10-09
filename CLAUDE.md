@@ -7,16 +7,20 @@
 `/docs` 放文件，所以 `index.html` 就是首頁，直接可玩。
 
 ```
-index.html       畫面骨架、面板、CDN script 標籤（約 230 行）
-app.js           全部的程式（約 3200 行）
-models/          MoveNet 權重（本機讀 4ms；缺檔會自動回去用 CDN）
+index.html       畫面骨架、面板、CDN script 標籤（約 250 行）
+app.js           全部的程式（約 3700 行）
+models/          MoveNet 權重（本機讀 4ms；線上會跟 jsDelivr 賽跑）
 tests/           純邏輯單元測試 + 動作語料 + Gherkin 執行器
 features/        驗收條件（Gherkin，繁中關鍵字）
 menu.sh          start/stop/open/check/test/pwlog/models/quantize
+run.sh           只起一個靜態伺服器（menu.sh 的簡化版）
+quantize.py      float16 → uint8 再量化。**量過行不通**，見 METHOD §5.2，
+                 留著讓實驗可重現
 docs/METHOD.md   方法與量測（像論文那樣寫：理論、公式、為什麼、量到多少）
 docs/DEV.md      這裡有什麼、怎麼跑、各項預設值與理由
 HANDOFF.md       現況與待辦
 README.md        給第一次看到這個 repo 的人
+LICENSE          MIT
 .claude/skills/  兩份專案 skill：先讀跑起來的那個、用語料訂規則
 ```
 

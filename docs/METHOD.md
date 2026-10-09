@@ -883,11 +883,15 @@ CPU→GPU 的來回。
 遊戲本體放在 repo 根目錄，因為 GitHub Pages 只能從根目錄或 `/docs` 發佈。
 
 ```
-index.html          畫面骨架、面板、CDN script 標籤（約 230 行）
-app.js              全部的程式（約 3200 行）
-models/             MoveNet 權重三組（lightning / lightning-uint8 / thunder）
+index.html          畫面骨架、面板、CDN script 標籤（約 250 行）
+app.js              全部的程式（約 3700 行）
+models/             MoveNet 權重兩組（lightning / thunder）—— uint8 那組已移除，見 §5.2
 menu.sh             start/stop/open/check/test/pwlog/models/quantize
-quantize.py         float16 → uint8 再量化（自己寫的，見 5.2）
+quantize.py         float16 → uint8 再量化（自己寫的）。**量過行不通**，見 §5.2；
+                    留著讓實驗可重現
+run.sh              只起一個靜態伺服器（menu.sh 的簡化版）
+LICENSE             MIT
+.claude/skills/     兩份專案 skill：先讀跑起來的那個、用語料訂規則
 tests/              純邏輯單元測試（14 檔 246 條）
 tests/gestures.js   動作語料產生器
 tests/bdd.js        零相依的 Gherkin 執行器（繁中關鍵字）

@@ -4,4 +4,7 @@
 # codegraph 的索引資料庫是每台機器各自的
 .codegraph/
 
+# quantize.py 被 import 進來分析時會產生的位元碼，不是原始碼
+__pycache__/
+
 .DS_Store
