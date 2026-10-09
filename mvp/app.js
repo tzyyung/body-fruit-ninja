@@ -673,6 +673,21 @@
              foreLen, useElbow, off };
   }
 
+  // 這一幀的掌刀在 3D 的哪裡（肩膀座標系）。
+  // 掌刀 = 手腕 + K×(手腕 − 手肘)，三維版就是把同一條式子套在還原後的向量上。
+  const lastLift = { left: null, right: null };
+  function palm3D(side, sh, eb, wr, K) {
+    const fore = bodyScale(pipeKp);
+    if (!(fore > 4)) return null;
+    const L = liftChain(sh, eb, wr, fore, lastLift[side]);
+    lastLift[side] = L;
+    const e = { x: eb.x - sh.x, y: eb.y - sh.y, z: L.z1 };
+    const w = { x: L.x, y: L.y, z: L.z };          // 手腕（肩膀座標系）
+    return { x: w.x + (w.x - e.x) * K,
+             y: w.y + (w.y - e.y) * K,
+             z: w.z + (w.z - e.z) * K };
+  }
+
   function bladeFor(side, kp, now) {
     if (ui.stable.checked && !armVisible(side, kp)) return null;
     const mirror = (k) => ({ x: cv.width - k.x, y: k.y, score: k.score });
@@ -704,7 +719,10 @@
         const foreLen = Math.hypot(wrist.x - eb.x, wrist.y - eb.y);
         stats.forearm = Math.max(stats.forearm, foreLen);
         const pt = palmPoint(wrist, eb, sh, K, bodyScale(kp));
-        return { bx:pt.x, by:pt.y, tx:pt.x, ty:pt.y, pad: px(PALM_PAD) };
+        // 這一幀的 3D 位置要在這裡算 —— 軌跡點是過去的刀刃位置，
+        // 到了量揮擊長度的時候已經拿不到當時的肩肘腕了。
+        return { bx:pt.x, by:pt.y, tx:pt.x, ty:pt.y, pad: px(PALM_PAD),
+                 v3: palm3D(side, sh, eb, wrist, K) };
       }
       // 鏈不成立 → 沒有刀。不做「退化成手腕單點」。
       //
@@ -850,38 +868,93 @@
   // 兩個根（±z）的歧義用時間連續性解：選離上一幀比較近的那個。
   // 這是 2D→3D pose lifting 的標準做法（骨長約束 + 時間平滑）。
   const ARM_OVER_FOREARM = 2.2;        // 上臂 30cm + 前臂 25cm ÷ 前臂 25cm
-  // 整段都維持在這個比例以上，就表示手臂在鏡頭平面內：
-  // 那時 2D 量得準，而 z 的導數 dz/dd → ∞ 是病態的，不要用它。
-  const LIFT_PLANAR = 0.95;
-  // 投影上的 肩→腕 至少要有 肩→肘→腕 的這個比例，才算「手臂伸直」。
-  // 完全伸直時是 1.0；0.9 大約對應手肘彎 50° 以內。
-  const STRAIGHT_ARM = 0.90;
-
-  function liftZ(dx, dy, armLen, prevZ) {
-    const z = Math.sqrt(Math.max(0, armLen * armLen - (dx * dx + dy * dy)));
-    return (prevZ != null && prevZ < 0) ? -z : z;
+  const UPPER_OVER_FOREARM = 1.2;      // 上臂 30cm ÷ 前臂 25cm
+  // 追蹤抖動的尺度，用前臂長的比例表示（前臂 151px 時約 6px，與實測相符）
+  const LIFT_SIGMA = 0.04;
+  // z 要大過自己的誤差幾倍才採信。語料掃出來的（每格 2200 次動作）：
+  //
+  //    K     支援區域 reliability   彎手臂偵測   誤報
+  //    0            83.0%            70.2%      233   ← 無條件採信 z
+  //    3            88.7%            73.4%      140
+  //    6            97.0%            85.7%        0
+  //   10            95.0%            92.5%        0   ← 總偵測率最高 93.8%
+  //  200            90.4%            90.0%        0   ← 等於完全關掉 3D
+  //
+  // 選 10：總偵測率最高，而且比「完全關掉 3D」高 3.6 個百分點 ——
+  // 那 3.6 點就是 Taylor 還原實際賺到的東西。
+  const LIFT_TRUST_K = 10;
+  // Taylor 的逐段還原（Reconstruction of Articulated Objects from Point
+  // Correspondences in a Single Uncalibrated Image, C.J. Taylor, CVIU 2000）。
+  //
+  // 弱透視 + 已知骨長，每一段骨頭各自解一次：
+  //
+  //     ΔZ = ±√( L² − (Δu² + Δv²) )        L 是換算成像素的真實骨長
+  //
+  // 關鍵是「逐段」。先前的版本把整條手臂當一顆球（肩為心、半徑＝臂長），
+  // 那只在手臂伸直時成立 —— 手肘一彎，手腕的半徑就變短，而球面模型會把
+  // 那個變短硬解成「手往深處去了」，憑空捏造出 0.9 倍臂長的深度。
+  // 逐段就沒有這個問題：手肘彎多少由 肘→腕 那一段自己承擔。
+  //
+  // 論文另外兩個結論也直接用上：
+  //  1) 解是一整族，由尺度 s 參數化，而 s 的下界是 max(投影長 / 真實長) ——
+  //     也就是「投影只會變短」的正式版。我們有校正值，s 直接拿來用。
+  //  2) 每段有獨立的 ± 歧義（n 段 2^(n−1) 種）。這裡用時間連續性挑：
+  //     取跟上一幀同號的那個根。
+  //
+  // 回傳肩膀座標系下的 3D 手腕向量（肩膀在原點）。
+  function liftChain(sh, eb, wr, foreLenPx, prev) {
+    const L1 = foreLenPx * UPPER_OVER_FOREARM;   // 上臂，換算成像素
+    const L2 = foreLenPx;                        // 前臂
+    const e = { x: eb.x - sh.x, y: eb.y - sh.y };
+    const w = { x: wr.x - eb.x, y: wr.y - eb.y };
+    // 判別式為負＝投影比真實骨長還長，只可能是量測誤差（投影不會變長）。
+    // 夾到 0 而不是丟掉 —— 量測誤差把投影推過骨長是常態。
+    // 只在 z 大於它自己的誤差時才採信。
+    //
+    // dz/dd = −d/z，所以 σ_z = (d/z)·σ_d —— z→0（投影長接近骨長、手臂落在
+    // 鏡頭平面內）時誤差發散。實測不處理的話，靜止的手光靠 ±6px 抖動就能
+    // 生出 233 次假揮擊，而同樣條件下純 2D 是 0 次。
+    // 採信條件 z > √(d·σ_d·K)：要求訊號大過雜訊 K 倍。不採信就設 0，
+    // 等價於「手臂就在鏡頭平面內」—— 那正是這種情況下最接近的合法解，
+    // 而且會自動退回 2D 的量法。
+    const sig = Math.max(1, foreLenPx * LIFT_SIGMA);
+    const trust = (z, d) => (z * z > d * sig * LIFT_TRUST_K ? z : 0);
+    const d1 = Math.hypot(e.x, e.y), d2 = Math.hypot(w.x, w.y);
+    const z1 = trust(Math.sqrt(Math.max(0, L1 * L1 - d1 * d1)), d1);
+    const z2 = trust(Math.sqrt(Math.max(0, L2 * L2 - d2 * d2)), d2);
+    const s1 = (prev && prev.z1 < 0) ? -1 : 1;
+    const s2 = (prev && prev.z2 < 0) ? -1 : 1;
+    return { x: e.x + w.x, y: e.y + w.y, z: s1 * z1 + s2 * z2,
+             z1: s1 * z1, z2: s2 * z2 };
   }
 
   // 真正的 3D 掃過量，換算成「等效弧長 px」，跟畫面上的量同單位。
-  function sweep3D(run, sh, armLen) {
+  // 真正的 3D 掃過量，換算成「等效弧長 px」，跟畫面上的量同單位。
+  // 每個軌跡點上的 v3 是它產生當下用 Taylor 逐段還原出來的（見 palm3D）。
+  function sweep3D(run, armLen) {
     let total = 0;
     for (const seg of segments(run)) {
       if (seg.length < 2) continue;
-      let pz = null, prev = null;
+      // 取這一段「頭到尾」的角度，不要逐步累加。
+      //
+      // 逐步累加等於路徑長，抖動會一路加上去 —— 而 3D 這邊抖動特別大：
+      // dz/dd = −d/z，z→0 時誤差發散。實測逐步累加讓靜止的手產生 268 次誤報，
+      // 而 2D 路徑同樣條件是 0 次，差別就在 2D 是「分段擬合取端點距離」，
+      // 中間的抖動互相抵消。這裡套同一招：只看端點。
+      // 段落已經在方向反轉處切開了，所以每段大致單向，端點距離就是掃過量。
+      let a = null, b = null;
       for (const q of seg) {
-        const dx = q.x - sh.x, dy = q.y - sh.y;
-        const z = liftZ(dx, dy, armLen, pz);
-        pz = z;
-        const v = { x: dx, y: dy, z };
-        if (prev) {
-          const na = Math.hypot(prev.x, prev.y, prev.z), nb = Math.hypot(v.x, v.y, v.z);
-          if (na > 1 && nb > 1) {
-            const c = Math.min(1, Math.max(-1,
-              (prev.x*v.x + prev.y*v.y + prev.z*v.z) / (na * nb)));
-            total += Math.acos(c) * armLen;
-          }
+        if (!q.v3) continue;
+        if (!a) a = q.v3;
+        b = q.v3;
+      }
+      if (a && b) {
+        const na = Math.hypot(a.x, a.y, a.z), nb = Math.hypot(b.x, b.y, b.z);
+        if (na > 1 && nb > 1) {
+          const c = Math.min(1, Math.max(-1,
+            (a.x*b.x + a.y*b.y + a.z*b.z) / (na * nb)));
+          total += Math.acos(c) * armLen;
         }
-        prev = v;
       }
     }
     return total;
@@ -898,39 +971,18 @@
   //
   // 取 max 而不是二選一：投影只會變短，所以 2D 是真值的下界，
   // 兩個都算、取大的，不會比單用 2D 差。
-  function sweepOf(run, side) {
+  // 這一刀掃過多少。
+  //
+  // 2D（畫面上的掃過長）是真值的**下界** —— 投影只會變短。
+  // 3D（Taylor 逐段還原後的真實角度）把前縮補回來，但在輪廓邊界上
+  // （投影長接近真實骨長、判別式趨近 0）導數發散、對抖動極敏感。
+  // 所以兩個都算、取大的：3D 失準時它給出的值不會比 2D 大多少，
+  // 2D 失準時（手臂朝鏡頭橫揮）3D 把它救回來。
+  function sweepOf(run) {
     const flat = sweepLen(run);
-    const sh0 = pipeKp[side + '_shoulder'], eb0 = pipeKp[side + '_elbow'];
-    const wr0 = pipeKp[side + '_wrist'];
-    if (!sh0 || !eb0 || !wr0) return flat;
-    if (sh0.score < MIN_SCORE || eb0.score < scoreNeed('elbow')
-        || wr0.score < MIN_SCORE) return flat;
     const armLen = bodyScale(pipeKp) * ARM_OVER_FOREARM;
     if (!(armLen > 4)) return flat;
-
-    // ★ 球面模型只在「手臂伸直」時成立。
-    //
-    // 手不是在球面上，是在球**體**裡 —— 球面只是外邊界，手肘一彎半徑就變短。
-    // 假設永遠伸直的話，手肘彎著揮時 z = √(L²−d²) 會憑空捏造出很大的深度，
-    // 算出來的角度整個是假的（驗收測試在「伸展 0.4」那幾列抓到這件事）。
-    //
-    // 真正通用的做法是逐段 lifting（肩→肘一顆球、肘→腕一顆球，各自用自己的
-    // 骨長），那是文獻裡的骨長約束。還沒做，也還沒有對應的語料可以驗，
-    // 所以這裡只在「投影上手臂接近伸直」時才用球面模型 ——
-    // 那是它唯一站得住腳的區域。其餘一律退回 2D（2D 是真值的下界，不會更糟）。
-    const d1 = Math.hypot(sh0.x - eb0.x, sh0.y - eb0.y);
-    const d2 = Math.hypot(eb0.x - wr0.x, eb0.y - wr0.y);
-    const d0 = Math.hypot(sh0.x - wr0.x, sh0.y - wr0.y);
-    if (d1 + d2 < 4 || d0 < (d1 + d2) * STRAIGHT_ARM) return flat;
-
-    // 軌跡點是鏡像過的畫布座標，肩膀要套同一個鏡像才在同一個空間
-    const sh = { x: cv.width - sh0.x, y: sh0.y };
-    let minRatio = 1;
-    for (const q of run) {
-      minRatio = Math.min(minRatio, Math.hypot(q.x - sh.x, q.y - sh.y) / armLen);
-    }
-    if (minRatio > LIFT_PLANAR) return flat;     // 手臂在鏡頭平面內，2D 就準
-    return Math.max(flat, sweep3D(run, sh, armLen));
+    return Math.max(flat, sweep3D(run, armLen));
   }
 
   function activeRun(tr) {
@@ -967,7 +1019,7 @@
     //   各段相加（現在）         88%        0%
     //
     // 三種判準的誤判率都是 0%，所以選涵蓋面最好的那個。
-    const sweep = sweepOf(run, side);
+    const sweep = sweepOf(run);
     const slashing = !gateMoving() || sweep >= slashMinPx();
     stats.strokeMax = Math.max(stats.strokeMax, sweep);
     stats.linSum += fit.linearity; stats.linN++;
@@ -2232,7 +2284,8 @@
           if (linked) stats.linkOk++;
           stats.gapSum += L.dist; stats.gapN++;
         }
-        trails[side].push({ x:b.tx, y:b.ty, t:now, linked, moving, pad: b.pad || 0 });
+        trails[side].push({ x:b.tx, y:b.ty, t:now, linked, moving,
+                            pad: b.pad || 0, v3: b.v3 || null });
         bases[side].push({ x:b.bx, y:b.by, t:now, linked, moving });
         prev[side] = { tx:b.tx, ty:b.ty, t:now, fast };
       } else {
