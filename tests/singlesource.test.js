@@ -132,6 +132,38 @@ for (const [gate, caller] of [
     body(caller).includes(gate + '('), true);
 }
 
+section('記住偏好只能在使用者真的選了之後');
+
+// 2026-10-09 量到的：setPanel 無條件寫 localStorage，於是「還沒選過」
+// 這個憑據（null）在第一次載入就被寫掉，下面那條「沒設定過就跟著斷點走」
+// 從此永遠跑不到 —— 在桌機開再轉直式，面板還是展開，畫布被擠成 272px 高、
+// 整頁多出 1448px 捲動。跟 §4.2b 同一族：判斷要不要套預設的依據，
+// 被套預設的動作自己摧毀。
+{
+  t('setPanel 有 remember 參數', /function setPanel\(show, remember\)/.test(code), true);
+  only('寫入面板偏好的地方', 'localStorage.setItem(PANEL_KEY', 1, '只能在 setPanel 裡');
+  // 括號要真的配對 —— setPanel(saved === null ? !narrow() : …) 裡有巢狀的 ()，
+  // 用 /setPanel\([^;]*?\)/ 只會配到第一個右括號（實測只抓到 0 個 remember=true）
+  const calls = [];
+  for (let i = code.indexOf('setPanel('); i >= 0; i = code.indexOf('setPanel(', i + 1)) {
+    // 宣告那一行不算呼叫
+    if (/function\s+$/.test(code.slice(Math.max(0, i - 10), i))) continue;
+    let d = 0, j = i + 'setPanel'.length;
+    for (; j < code.length; j++) {
+      if (code[j] === '(') d++;
+      else if (code[j] === ')' && --d === 0) break;
+    }
+    calls.push(code.slice(i, j + 1));
+  }
+  const remembering = calls.filter((c) => /,\s*true\s*\)$/.test(c));
+  t('setPanel(..., true) 只有一個呼叫點', remembering.length, 1);
+  t('那個呼叫點是按鈕的 click',
+    /addEventListener\('click', \(\) => setPanel\([^;]*?,\s*true\s*\)\)/.test(code), true);
+  // 套預設的兩處都不准記住，否則 null 又會被寫掉
+  t('每個 setPanel 呼叫都明寫 remember',
+    calls.filter((c) => !/,\s*(true|false)\s*\)$/.test(c)).length, 0);
+}
+
 section('自適應量一律走 Tracked，不要手刻 band/dwell');
 
 // CLAUDE.md §2 的規定。手刻一套就會多一組沒人維護的遲滯邏輯。

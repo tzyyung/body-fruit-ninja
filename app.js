@@ -1276,11 +1276,18 @@
                     : !document.body.classList.contains('panel-closed');
   }
 
-  function setPanel(show) {
+  // remember 只在使用者「真的按了那顆鈕」時為真。
+  // 原本無條件寫 localStorage —— 那會把「還沒選過」這個憑據（null）
+  // 在第一次載入就寫掉，於是下面那條「沒設定過就跟著斷點走」永遠跑不到：
+  // 在桌機開（寫成 '1'）再轉成直式，面板還是展開，畫布被擠成 272px 高、
+  // 整頁多出 1448px 捲動（量過）。
+  // 跟 §4.2b 同一族：判斷「要不要套預設」的依據，被套預設的動作自己摧毀。
+  function setPanel(show, remember) {
     document.body.classList.toggle('panel-open', !!show);
     document.body.classList.toggle('panel-closed', !show);
     ui.panelBtn.setAttribute('aria-expanded', show ? 'true' : 'false');
     ui.panelBtn.textContent = show ? '收起量測' : '量測';
+    if (!remember) return;
     try { localStorage.setItem(PANEL_KEY, show ? '1' : '0'); } catch (e) { /* 無痕視窗會丟錯 */ }
   }
 
@@ -1308,13 +1315,13 @@
   (function initPanel() {
     let saved = null;
     try { saved = localStorage.getItem(PANEL_KEY); } catch (e) { /* 同上 */ }
-    setPanel(saved === null ? !narrow() : saved === '1');
-    ui.panelBtn.addEventListener('click', () => setPanel(!panelShown()));
+    setPanel(saved === null ? !narrow() : saved === '1', false);
+    ui.panelBtn.addEventListener('click', () => setPanel(!panelShown(), true));
     // 轉向或縮放視窗時，沒有自己設定過就跟著斷點走
     window.matchMedia('(max-width: 900px)').addEventListener('change', () => {
       let s2 = null;
       try { s2 = localStorage.getItem(PANEL_KEY); } catch (e) { /* 同上 */ }
-      if (s2 === null) setPanel(!narrow());
+      if (s2 === null) setPanel(!narrow(), false);
     });
   })();
 

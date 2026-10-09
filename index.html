@@ -49,12 +49,18 @@
      高度 1045px，溢出視窗 145px；iPhone 橫式溢出 220px。
      做法：由「可用高度 × 長寬比」反推 max-width。
      --ar 由 JS 在相機解析度確定後寫入（4:3 或 16:9 都可能）。 */
+  /* 可用高度的單一來源。畫面和量測面板共用這一個預算 ——
+     兩邊各寫一次就會各自漂走。
+     100vh 在手機上是謊話（它用「工具列收起來」的高度算，實際可見區更小），
+     svh 才是「工具列都在」時的高度。舊瀏覽器用 vh 墊底。
+     2.5rem 是 .wrap 的上下 padding（16+16）加一點餘裕。 */
+  :root { --avail: calc(100vh - 2.5rem); }
+  @supports (height: 100svh) {
+    :root { --avail: calc(100svh - 2.5rem); }
+  }
   .stage { position:relative; flex:1 1 640px; min-width:0;
            --ar:1.3333;
-           max-width:min(100%, calc((100svh - 2.5rem) * var(--ar))); }
-  @supports not (height: 100svh) {
-    .stage { max-width:min(100%, calc((100vh - 2.5rem) * var(--ar))); }
-  }
+           max-width:min(100%, calc(var(--avail) * var(--ar))); }
   canvas { width:100%; height:auto; aspect-ratio:var(--ar);
            display:block; background:#000; border-radius:10px;
            touch-action:none; }   /* 畫布上要能滑，不要被捲動搶走 */
@@ -124,6 +130,11 @@
   /* 寬螢幕預設顯示；按了收合鈕才隱藏 */
   @media (min-width: 901px) {
     body.panel-closed .panel { display:none; }
+    /* 面板展開時有 2005px 高，整頁會多出 1286px 的捲動（量過）。
+       遊戲畫面本身還是看得見，但第一次來的人看到的是一牆會捲的數字。
+       讓它在自己裡面捲，頁面就不動。窄螢幕不套這條 ——
+       那邊面板是排在畫面下面，頁面本來就該捲。 */
+    .panel { max-height: var(--avail); overflow-y: auto; }
   }
   /* 直式（手機）：提示框的字要小一點，不然會溢出 */
   @media (max-aspect-ratio: 3/4) {
