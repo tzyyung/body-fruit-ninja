@@ -4,43 +4,21 @@
 // 校正前臂被幽靈手臂的樣本汙染到 40px（真實約 200px），
 // 於是 chainOK 的前臂上界變成「超過 88px 就擋」，真手臂一律不合格，
 // 鏈永遠不成立 → SPRT 掉到下界 → 永遠沒有刀，而且不會自己好。
-const fs = require('fs');
-const path = require('path');
-const src = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
-const grab = (re, name) => {
-  const m = src.match(re);
-  if (!m) { console.error('抽不到 ' + name); process.exit(1); }
-  return m[0].replace(/^  (function|const)/, '$1');
-};
-const num = (name) => {
-  const m = src.match(new RegExp('const ' + name + ' = ([\\d.]+)'));
-  if (!m) { console.error('抽不到常數 ' + name); process.exit(1); }
-  return Number(m[1]);
-};
+const H = require('./_harness.js');
+const { t, section, done } = H;
 
-const UPPER_VS_SHOULDER_HI = num('UPPER_VS_SHOULDER_HI');
-const FORE_VS_SHOULDER_HI  = num('FORE_VS_SHOULDER_HI');
-const FORE_VS_SHOULDER_LO  = num('FORE_VS_SHOULDER_LO');
+const UPPER_VS_SHOULDER_HI = H.num('UPPER_VS_SHOULDER_HI');
+const FORE_VS_SHOULDER_HI  = H.num('FORE_VS_SHOULDER_HI');
+const FORE_VS_SHOULDER_LO  = H.num('FORE_VS_SHOULDER_LO');
 let calib = null;
 const chainWhy = { left: null, right: null };
-eval(grab(/  function chainOK\(sh, eb, wr, shoulderW, side\) \{[\s\S]*?\n  \}/, 'chainOK'));
-// const 在 eval 裡是 eval 自己的區塊作用域，外面拿不到 ——
-// 所以這兩個要取右手邊的函式運算式再 eval。function 宣告沒這個問題。
-const rhs = (re, name) => {
-  const code = grab(re, name);
-  return eval('(' + code.slice(code.indexOf('=') + 1).replace(/;\s*$/, '') + ')');
-};
-const median = rhs(/  const median = \(v\) => \{[\s\S]*?\n  \};/, 'median');
-const pctile = rhs(/  const pctile = \(v, q\) => \{[\s\S]*?\n  \};/, 'pctile');
-eval(grab(/  function Tracked\(opts\) \{[\s\S]*?\n  \}\n/, 'Tracked'));
+const median = eval(H.expr('median'));
+const pctile = eval(H.expr('pctile'));
+eval(H.fn('chainOK'));
+eval(H.fn('forearmSampleOK'));
+eval(H.fn('Tracked'));
 
 const P = (x, y) => ({ x, y });
-let fails = 0;
-const t = (name, got, want) => {
-  const ok = JSON.stringify(got) === JSON.stringify(want);
-  if (!ok) fails++;
-  console.log((ok ? '  ok   ' : '  FAIL ') + name + '  期望 ' + want + ' 得到 ' + got);
-};
 
 console.log('上臂/肩寬上界 =', UPPER_VS_SHOULDER_HI,
             ' 前臂/肩寬 =', FORE_VS_SHOULDER_LO + '–' + FORE_VS_SHOULDER_HI);
@@ -109,6 +87,23 @@ console.log('  過肩寬閘門後剩 ' + gated.length + '/' + samples.length
 t('幽靈樣本全部被肩寬閘門擋掉', gated.every((v) => v >= 96), true);
 t('真手樣本沒有被誤擋', gated.length, 40);
 
+console.log('\n校正樣本的閘門 —— 尺規必須獨立於估計器');
+
+// 2026-10-09 兩次「前臂被學壞」（40px、17px）的共同出口。
+// 原本寫成 if (sw > 4 && 不合理) continue —— 肩膀看不到時整道閘門被略過，
+// 什麼長度都收。而「單手舉起、另一邊肩膀只有 0.1x」是常態不是例外。
+t('沒有肩寬就不可以收樣本（17px 那次的出口）', forearmSampleOK(17, 0), false);
+t('沒有肩寬時，連看起來合理的長度也不收', forearmSampleOK(200, 0), false);
+t('肩寬小到不可信（4px）也不收', forearmSampleOK(200, 4), false);
+t('真實前臂 200 / 肩寬 320（比值 0.63）要收', forearmSampleOK(200, 320), true);
+t('幽靈手臂 40 / 肩寬 320（比值 0.13）不收', forearmSampleOK(40, 320), false);
+t('幽靈手臂 17 / 肩寬 320（比值 0.05）不收', forearmSampleOK(17, 320), false);
+t('錯配到對側 500 / 肩寬 320（比值 1.56）仍收（上界留餘裕）',
+  forearmSampleOK(500, 320), true);
+t('錯配到 600 / 肩寬 320（比值 1.88）不收', forearmSampleOK(600, 320), false);
+t('手伸直朝鏡頭、投影剩 90 / 肩寬 320（0.28）不收 —— 前縮的幀不該拿來估長度',
+  forearmSampleOK(90, 320), false);
+
 console.log('\nTracked —— 鎖定前的值不可以被權重套兩次');
 
 const trk = Tracked({ volatility: 'static', fallback: 0,
@@ -121,5 +116,4 @@ t('未鎖定時 value 已經含權重（所以 recalc 不能再乘一次）',
   Math.abs(trk.value - trk.raw * trk.weight) < 1e-9, true);
 t('raw 不含權重，等於真值', trk.raw, 200);
 
-console.log(fails ? '\n' + fails + ' 項失敗' : '\n全部通過');
-process.exit(fails ? 1 : 0);
+done();

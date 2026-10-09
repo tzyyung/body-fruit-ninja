@@ -221,6 +221,40 @@ do_quantize() {
   python3 quantize.py "$src" "$dst"
 }
 
+# 瀏覽器那邊的 console。Playwright MCP 把每一條訊息寫進
+# ../.playwright-mcp/console-<ISO>.log，重載或導航就開一個新檔 ——
+# 所以要看的永遠是**最新那個**，舊的留著只會害人看錯檔。
+PWLOG_KEEP=5
+pw_dir() { echo "../.playwright-mcp"; }
+
+pw_newest() {
+  ls -t "$(pw_dir)"/console-*.log 2>/dev/null | head -1
+}
+
+pw_prune() {
+  local old
+  old=$(ls -t "$(pw_dir)"/console-*.log 2>/dev/null | tail -n +$((PWLOG_KEEP + 1)))
+  [ -n "$old" ] && echo "$old" | xargs rm -- && \
+    printf '  %s清掉 %s 個舊紀錄，保留最近 %s 個%s\n' \
+      "$c_dim" "$(echo "$old" | wc -l | tr -d ' ')" "$PWLOG_KEEP" "$c_0"
+  return 0
+}
+
+do_pwlog() {
+  local f
+  f=$(pw_newest)
+  if [ -z "$f" ]; then
+    printf '  還沒有瀏覽器紀錄。用 Playwright 開過頁面之後才會有。\n'; return 1
+  fi
+  pw_prune
+  printf '%s%s%s  %s 行\n\n' "$c_b" "${f##*/}" "$c_0" "$(wc -l < "$f" | tr -d ' ')"
+  if [ -n "${1:-}" ]; then
+    grep -- "$1" "$f" | tail -40
+  else
+    tail -40 "$f"
+  fi
+}
+
 do_test() {
   local f fail=0
   for f in tests/*.test.js; do
@@ -248,6 +282,7 @@ menu() {
     printf '  %s4%s  重新啟動\n'                     "$c_c" "$c_0"
     printf '  %s5%s  自我檢查（語法、CDN、模型）\n'  "$c_c" "$c_0"
     printf '  %st%s  跑單元測試\n'                   "$c_c" "$c_0"
+    printf '  %sb%s  看瀏覽器 console（最新那個檔）\n' "$c_c" "$c_0"
   printf '  %s8%s  下載模型到本機（開頁不用再等 CDN）\n' "$c_c" "$c_0"
   printf '  %s9%s  量化成 uint8（體積減半，會損失精度）\n'   "$c_c" "$c_0"
     printf '  %s6%s  看伺服器紀錄\n'                 "$c_c" "$c_0"
@@ -262,6 +297,7 @@ menu() {
       4) do_stop; do_start ;;
       5) do_check ;;
       t|T) do_test ;;
+      b|B) do_pwlog ;;
       8) do_models ;;
       9) do_quantize ;;
       6) do_log ;;
@@ -280,9 +316,10 @@ case "${1:-}" in
   status) do_status ;;
   check)  do_check ;;
   test)   do_test ;;
+  pwlog)  shift; do_pwlog "${1:-}" ;;
   models) do_models ;;
   quantize) do_quantize ;;
   log)    do_log ;;
   ''|menu) menu ;;
-  *) printf '用法：%s [start|stop|restart|open|status|check|test|log|models|quantize]\n' "$0"; exit 1 ;;
+  *) printf '用法：%s [start|stop|restart|open|status|check|test|pwlog [關鍵字]|log|models|quantize]\n' "$0"; exit 1 ;;
 esac

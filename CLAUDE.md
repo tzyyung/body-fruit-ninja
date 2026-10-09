@@ -141,12 +141,24 @@ node mvp/tests/x.test.js      # 必須綠
 
 ### 怎麼取得數字（由好到壞）
 
-**1. 直接讀使用者正在跑的那個分頁。** Playwright 通常已經接上去了，
-而且這兩個**不會打斷他**：
+**1. log 在磁碟上，先去找它。** Playwright MCP 把每一條 console 訊息
+寫進 `.playwright-mcp/console-<ISO>.log`，帶時間戳和 `file:line`：
+
+```sh
+./menu.sh pwlog            # 最新那個檔的最後 40 行，順便清掉舊的
+./menu.sh pwlog '無刀'     # 只看含這個字串的
+```
+
+**重載／導航只是開一個新檔，舊的不會消失。** 導航本身不是問題，
+問題是有沒有去看對的那個檔 —— `pwlog` 一律取 `ls -t` 的第一個，
+並且只保留最近 5 個（舊的看了只會害人判斷錯一輪）。
+（`.playwright-mcp/` 已經在 `.gitignore` 裡。）
+
+**2. 直接讀使用者正在跑的那個分頁。** 這三個不會打斷他：
 
 ```
 browser_tabs(action="list")       確認接到哪個分頁
-browser_console_messages()        讀 console
+browser_console_messages()        讀目前分頁的 console 緩衝
 browser_evaluate(() => ...)       讀面板欄位
 ```
 
@@ -159,18 +171,17 @@ browser_evaluate(() => {
 })
 ```
 
-**絕對不要 `browser_navigate`** —— 會把他正在操作的畫面踢掉（相機、
-遊戲進度全沒）。真的要重載用 `browser_evaluate(() => location.reload())`，
-而且先講一聲。
+要重載就重載（`location.reload()` 或 `browser_navigate` 都行），
+先跟他講一聲，然後記得去讀**新的**那個 log 檔。
 
-**2. 加 instrumentation，加在 console 不要加在畫布。**
+**3. 加 instrumentation，加在 console 不要加在畫布。**
 `app.js` 已經有：兩隻手都沒有刀時每秒印一次完整狀態 —— Λ、三項證據、
 上臂/前臂/肩寬與兩個比值、三個關節分數、擋下來的原因（搜 `logNoBlade`）。
 
 畫在 canvas 上踩過：診斷畫在 `y = 0.90 × 高`，最關鍵那行超出下緣被切掉，
 白白多一輪，而且使用者沒辦法複製貼上。
 
-**3. 請他貼 console**（文字，比截圖好）。**4. 請他截圖**（最差，會裁切）。
+**4. 請他貼 console**（文字，比截圖好）。**5. 請他截圖**（最差，會裁切）。
 
 ### 讀到數字之後
 

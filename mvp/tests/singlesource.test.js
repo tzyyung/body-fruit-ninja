@@ -1,0 +1,66 @@
+// 單一來源的機械檢查。
+//
+// 「同一段運算式只能有一個權威定義」靠紀律守不住 —— 複製出去的那幾份
+// 一定會各自漂走，而且改的時候只會改到其中幾處，其他測試還是綠的。
+// 所以直接掃原始碼數次數。
+//
+// 2026-10-09 的三個致命 bug 都是這條被違反的直接後果：
+//   - 同一個估計器被兩隻手餵（校正前臂鎖在 40px）
+//   - 顯示用的 kp 跟管線用的不是同一份（手臂被刪了畫面還顯示三個綠分數）
+//   - calib fallback 在五個地方各寫一次，其中兩處的預設值還不一樣
+const H = require('./_harness.js');
+const { t, section, done } = H;
+
+// 把註解和字串拿掉再數，不然文件裡提到的名字會被算進去
+const code = H.src
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+  .split('\n')
+  .map((l) => l.replace(/\/\/.*$/, ''))
+  .join('\n');
+
+const count = (needle) => code.split(needle).length - 1;
+
+function only(label, needle, max, who) {
+  const c = count(needle);
+  const ok = c <= max;
+  t(label + '（' + who + '）', ok ? c : c + ' 處，應 ≤ ' + max, ok ? c : '≤ ' + max);
+}
+
+section('尺度與門檻只能有一個權威定義');
+
+// bodyScale() 是「這個人現在有多大」的唯一答案。
+// 例外：chainWhy 的診斷要特地回報「相對校正值」的比值，那是它的本意。
+only('校正前臂的 fallback', 'calib.forearm > 4', 2, 'bodyScale + chainWhy 診斷');
+only('畫面比例的保底值', 'px(0.09)', 1, '只能在 bodyScale 裡');
+
+// scoreNeed() 是「這個點可不可信」的唯一答案
+only('手肘信心門檻', 'MIN_SCORE * ELBOW_SCORE_MUL', 1, '只能在 scoreNeed 裡');
+
+section('這一幀的關節只有兩份，而且只組一次');
+
+// 顯示用的程式碼自己從 lastPose 再組一份，就會看不到管線後面做的刪除 ——
+// 手臂已經被剔除，畫面上還顯示三個漂亮的綠色分數。
+t('沒有任何地方自己從 lastPose 重建 kp', count('lastPose.keypoints'), 0);
+// 按「行」算，不要按「出現次數」算 —— 宣告那一行同時有兩個名字。
+const writeLines = code.split('\n').filter((l) => /\b(rawKp|pipeKp)\s*=[^=]/.test(l));
+t('rawKp / pipeKp 只有三行會寫到（宣告 + 各一次指派）', writeLines.length, 3);
+t('其中剛好一行是宣告',
+  writeLines.filter((l) => /^\s*let\s/.test(l)).length, 1);
+
+section('關鍵判斷只能有一個入口');
+
+// 這些函式如果被繞過去（有人自己手刻一份同樣的判斷），
+// 規則就只會生效一部分，而測試照樣綠。
+for (const f of ['bodyScale', 'scoreNeed', 'chainOK', 'armsDistinct',
+                 'weakerArm', 'palmPoint', 'shoulderWidth', 'continuity', 'activeSide']) {
+  t('函式 ' + f + ' 只定義一次',
+    count('function ' + f + '('), 1);
+}
+
+section('自適應量一律走 Tracked，不要手刻 band/dwell');
+
+// CLAUDE.md §2 的規定。手刻一套就會多一組沒人維護的遲滯邏輯。
+t('Tracked 只有一個實作', count('function Tracked('), 1);
+t('CUSUM 的決策界限只算一次', count('o.dwell * o.band'), 1);
+
+done();

@@ -211,6 +211,17 @@
   const track = { left: 0, right: 0 };
   const confirmed = { left: false, right: false };
 
+  // 這一幀的關節，只有兩份，而且只在 ingestPose 組一次。
+  //
+  //   rawKp —— 模型原封不動的輸出。要回答「模型看到什麼」用這個。
+  //   pipeKp —— 穩定化、左右修正、重疊剔除之後，bladeFor 真正看到的那份。
+  //             要回答「遊戲用了什麼」用這個。
+  //
+  // 顯示用的程式碼一律讀這兩個，**不要自己從 lastPose 再組一次**。
+  // 原本有七個地方各組一份，後果是骨架與面板畫的是管線前的資料 ——
+  // 手臂已經被剔除了，畫面上還顯示三個漂亮的綠色分數。
+  let rawKp = {}, pipeKp = {};
+
   // 這一幀為什麼沒有刀，是哪一關擋的。
   // 畫面上三個關節分數全綠、卻看不到手掌時，使用者只能猜是自己站錯還是程式壞了 ——
   // 而真正的原因（鏈沒確認、被另一手蓋掉）根本不在那三個數字裡。
@@ -419,9 +430,9 @@
   // 而單手舉起時，模型本來就一定會替沒舉的那隻手吐出一組 0.1x 的猜測 ——
   // 那正是這裡最常遇到的輸入，不是例外。
   function armsDistinct(kp) {
-    const scale = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
+    const scale = bodyScale(kp);
     const sep = (part) => {
-      const need = part === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE;
+      const need = scoreNeed(part);
       const a = kp['left_' + part], b = kp['right_' + part];
       if (!a || !b || a.score < need || b.score < need) return Infinity;
       return Math.hypot(a.x - b.x, a.y - b.y);
@@ -468,12 +479,7 @@
   function continuity(side, kp, now) {
     const h = chainHist[side];
     if (!h || now - h.t > CHAIN_MEM_MS) return 0;
-    // 尺度優先用校正前臂，沒有就用當幀肩寬換算（前臂≈0.63 肩寬），
-    // 最後才退回畫面比例。px(0.09) = 57.6px，預算只有 32px/幀，
-    // 手肘被模型亂猜時一定過不了。
-    const sw = shoulderWidth(kp);
-    const scale = (calib && calib.forearm > 4) ? calib.forearm
-                : (sw > 4) ? sw * 0.63 : px(0.09);
+    const scale = bodyScale(kp);
     // 允許的位移隨經過時間放大，掉幀時才不會誤判成接不上
     const budget = scale * CHAIN_MOVE * Math.max(1, (now - h.t) / 33);
     let worst = 0;
@@ -512,7 +518,19 @@
       const okCont   = contVal > 0.25;
       const okStrong = wr.score >= MIN_SCORE * 1.5;
       evLast[side] = { chain: okChain, cont: okCont, contVal, strong: okStrong };
-      const d = llr('chain', okChain) + llr('cont', okCont) + llr('strong', okStrong);
+      // 三項證據不是條件獨立的。
+      //
+      // 幽靈鏈是「用真手的點拼出來的」—— 它既接得上上一幀（續✓）、
+      // 手腕信心也高（強✓）。所以鏈不成立的時候，「續」根本分不出
+      // 真手與幽靈，不該給它 +1.814。
+      //
+      // 不修的話有一個死區：鏈✗續✓強✓ = −2.639 +1.814 +0.827 = **+0.0014**，
+      // 每幀往上爬萬分之一 —— 既到不了上界也到不了下界，
+      // 15fps 下要 370 秒（6.2 分鐘）才爬得出來。
+      // 身體轉超過 60°（上臂/肩寬 > 1.5）就會進去，而那是往側邊揮刀的自然動作。
+      const d = llr('chain', okChain)
+              + (okChain ? llr('cont', okCont) : 0)
+              + llr('strong', okStrong);
       track[side] = Math.min(SPRT_A, Math.max(SPRT_B, track[side] + d));
       latch(side);
       // 歷史無條件記下來。
@@ -537,7 +555,34 @@
 
   const hasTrack = (side) => confirmed[side];
 
-  // 兩肩都看得到才有肩寬可用；只看得到一邊就回 0，那道檢查自動略過
+  // ── 單一來源：尺度與門檻 ────────────────────────────────────────────
+  //
+  // 這兩支是「這個人現在有多大」與「這個點可不可信」的唯一答案。
+  // 以前這兩條運算式各被複製了 5 次和 6 次，複製出去的一定會各自漂走 ——
+  // 而且改的時候只會改到其中幾處，測試還是綠的。
+
+  // 身體尺度：優先用校正前臂，沒有就用當幀肩寬換算，最後才退回畫面比例。
+  // 肩寬是這一幀直接量到的，不經過任何估計器，校正值壞掉時它還是對的。
+  function bodyScale(kp) {
+    if (calib && calib.forearm > 4) return calib.forearm;
+    const sw = kp ? shoulderWidth(kp) : 0;
+    if (sw > 4) return sw * FORE_OVER_SHOULDER;
+    return px(0.09);
+  }
+
+  // 這個關節要多少信心才算數。手肘要比手腕嚴，因為掌刀 = 手腕 + K×(手腕−手肘)，
+  // 手肘的誤差會被放大帶進來。
+  function scoreNeed(part) {
+    return part === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE;
+  }
+
+  // 兩肩都看得到才有肩寬可用；只看得到一邊就回 0，那道檢查自動略過。
+  //
+  // 刻意不提供「退回校正值」的版本：肩寬的用途就是當一把
+  // **不經過任何估計器**的尺規，退回 calib.forearm 等於讓估計器自己
+  // 當自己的裁判，學壞了就再也出不來（實機出現過 40px 與 17px 兩次）。
+  // 代價是量不到肩寬時 chainOK 的兩道上界會略過 —— 那是刻意的取捨，
+  // 寧可少一道檢查，也不要一道會自我汙染的檢查。
   function shoulderWidth(kp) {
     const l = kp.left_shoulder, r = kp.right_shoulder;
     if (!l || !r || l.score < MIN_SCORE || r.score < MIN_SCORE) return 0;
@@ -633,8 +678,7 @@
     const mirror = (k) => ({ x: cv.width - k.x, y: k.y, score: k.score });
     const get = (n) => {
       const k = kp[side + '_' + n];
-      const need = n === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE;
-      return k && k.score >= need ? mirror(k) : null;
+      return k && k.score >= scoreNeed(n) ? mirror(k) : null;
     };
     const wrist = get('wrist');
     if (!wrist) { noBlade[side] = '手腕看不清楚 —— 手舉高一點'; return null; }
@@ -659,8 +703,7 @@
       if (eb && sh && hasTrack(side)) {
         const foreLen = Math.hypot(wrist.x - eb.x, wrist.y - eb.y);
         stats.forearm = Math.max(stats.forearm, foreLen);
-        const ref = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
-        const pt = palmPoint(wrist, eb, sh, K, ref);
+        const pt = palmPoint(wrist, eb, sh, K, bodyScale(kp));
         return { bx:pt.x, by:pt.y, tx:pt.x, ty:pt.y, pad: px(PALM_PAD) };
       }
       // 鏈不成立 → 沒有刀。不做「退化成手腕單點」。
@@ -889,14 +932,52 @@
 
   let calLast = null;
 
+  // 現在在用的是哪一隻手。
+  // 模型對沒舉起的那隻手一樣會吐出一組座標，分數通常低一截 ——
+  // 用手腕分數高的那邊當「真的那隻」，不設門檻（設了就變成雞生蛋）。
+  function activeSide(kp) {
+    const sl = (kp.left_wrist  && kp.left_wrist.score)  || 0;
+    const sr = (kp.right_wrist && kp.right_wrist.score) || 0;
+    return sl >= sr ? 'left' : 'right';
+  }
+
+  // 這一筆「手肘→手腕」的長度，可不可以拿來當校正樣本。
+  //
+  // 尺規一定要是「不經過任何估計器」的量，所以只能用真的量到的肩寬。
+  // 不可以退回 calib.forearm —— 那等於讓估計器自己決定什麼叫合理，
+  // 一旦學壞就再也出不來。
+  //
+  // 沒有肩寬的那些幀「不收樣本」，不是「照收」。
+  // 原本寫成 if (sw > 4 && 不合理) continue —— 肩膀看不到時整道閘門被略過、
+  // 什麼長度都收。而「單手舉起、另一邊肩膀只有 0.1x」是常態不是例外，
+  // 實機因此先後把前臂學成 40px 和 17px（真實約 200px），整組門檻跟著崩掉。
+  function forearmSampleOK(len, shoulderW) {
+    if (!(shoulderW > 4)) return false;
+    const r = len / shoulderW;
+    return r >= FORE_VS_SHOULDER_LO && r <= FORE_VS_SHOULDER_HI;
+  }
+
   function feedCalib(kp) {
-    for (const side of SIDES) {
-      const e = kp[side + '_elbow'], w = kp[side + '_wrist'];
-      // 信心樣本要無條件收。
-      // 原本門檻設 0.25，但「光線差／框太近」正是拿不到 0.25 的時候 ——
-      // 要靠低信心才會啟動的自動放寬，卻用高信心當入場券，永遠跑不起來。
+    // 信心樣本只收「正在用的那隻手」。
+    //
+    // 原本兩隻手一起推進同一個 Tracked，而單手遊玩時每幀固定 2 真 2 幽靈 ——
+    // 雙峰分布的中位數卡在兩群中間的鞍點上，樣本數一點點失衡就整個翻面。
+    // 實機一局量到 MIN_SCORE 在 0.12 ↔ 0.37 之間來回跳（0.12/0.14 共 775 筆、
+    // 0.30 以上一批），肩膀 0.22 的真關節因此每十幀閃一次：
+    // 門檻 0.12 時過、0.30 時不過 → 那幀沒有刀 → prev 歸 null →
+    // 下一點 linked=false → activeRun 只剩一個點 → 刀痕永遠畫不出來。
+    //
+    // 只收一隻手之後分布是單峰的，中位數穩定，門檻跟著那隻手自己的水準走。
+    const act = activeSide(kp);
+    {
+      const e = kp[act + '_elbow'], w = kp[act + '_wrist'];
+      // 不設信心門檻 —— 自動放寬正是為了「拿不到高分」的情況設計的，
+      // 拿高分當入場券就永遠跑不起來。
       if (e) trk.score.push(e.score);
       if (w) trk.score.push(w.score);
+    }
+    for (const side of SIDES) {
+      const e = kp[side + '_elbow'], w = kp[side + '_wrist'];
       // 前臂樣本的門檻跟著 MIN_SCORE 走，不要寫死 0.25 ——
       // MIN_SCORE 會自動降到 0.12，寫死的話暗房裡刀能用但校正永遠不啟動。
       if (!e || !w || e.score < MIN_SCORE || w.score < MIN_SCORE) continue;
@@ -907,9 +988,7 @@
       // 手肘和手腕都猜在身體邊緣、擠成 20–50px。兩群數值混在一起取中位數，
       // 中位數就掉進幽靈那一群 —— 實測校正值因此鎖在 40px。
       // 肩寬是這一幀量到的，不經過估計器，拿它當尺規最安全。
-      const sw = shoulderWidth(kp);
-      if (sw > 4 && (len / sw < FORE_VS_SHOULDER_LO
-                  || len / sw > FORE_VS_SHOULDER_HI)) continue;
+      if (!forearmSampleOK(len, shoulderWidth(kp))) continue;
       if (trk.forearm.push(len) === 'changed') {
         // 位置變了就連雜訊地板一起重量 —— 距離不同，雜訊的像素尺度也不同。
         // 同時重開靜止窗，讓它有機會在新位置重新量一次。
@@ -1236,8 +1315,7 @@
   // 身體被裁掉 —— MoveNet 是看較完整的人訓練出來的，這時候叫人舉手沒有用。
   function framingHint() {
     if (!lastPose) return '站到鏡頭前面，讓上半身進到畫面裡';
-    const kp = {};
-    for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
+    const kp = rawKp;
     const sh = Math.max((kp.left_shoulder || {}).score || 0,
                         (kp.right_shoulder || {}).score || 0);
     const wr = Math.max((kp.left_wrist || {}).score || 0,
@@ -1254,8 +1332,7 @@
       ctx.fillText('完全沒偵測到人', cv.width / 2, y);
       return;
     }
-    const kp = {};
-    for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
+    const kp = rawKp;
 
     const why = SIDES
       .filter((sd) => noBlade[sd])
@@ -1299,8 +1376,8 @@
           x += 18;
           for (const part of ARM) {
             const k = kp[side + '_' + part];
-            const need = part === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE;
             const sc = k ? k.score : 0;
+            const need = scoreNeed(part);
             ctx.fillStyle = sc >= need ? '#4ade80' : '#f87171';
             ctx.fillText({ shoulder: '肩', elbow: '肘', wrist: '腕' }[part]
                          + ' ' + sc.toFixed(2), x, cy);
@@ -1344,8 +1421,7 @@
       ctx.fillText('模型完全沒回傳姿勢', cv.width / 2, cv.height * 0.5);
       return;
     }
-    const kp = {};
-    for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
+    const kp = rawKp;
     const X = (k) => cv.width - k.x;   // 畫面是鏡像的
 
     ctx.lineWidth = 2;
@@ -1358,7 +1434,7 @@
     }
     ctx.textAlign = 'left';
     ctx.font = '600 10px ui-monospace,Menlo,monospace';
-    for (const k of lastPose.keypoints) {
+    for (const k of Object.values(rawKp)) {
       if (!k.name) continue;
       const x = X(k), y = k.y;
       // 顏色代表分數：越綠越有信心
@@ -1578,6 +1654,9 @@
   // 不必等校正 —— 而且少了它，光靠「上臂/前臂比例」擋不住配錯的手肘：
   // 錯配出來的鏈比例可能剛好落在合理範圍內，只有絕對尺度看得出不對。
   const UPPER_VS_SHOULDER_HI = 1.5;
+  // 成人前臂約 25cm、肩寬約 40cm。這個比值是「沒有校正值時怎麼估身體尺度」
+  // 與「樣本合不合理」共用的那一個常數。
+  const FORE_OVER_SHOULDER = 0.63;
   // 前臂相對肩寬的上界。真實比值約 0.63，投影只會更短，1.6 留足餘裕。
   const FORE_VS_SHOULDER_HI = 1.6;
   // 收校正樣本時的合理範圍（下界只用在「要不要採信這個樣本」，
@@ -1915,6 +1994,7 @@
     lastPose = pose;
     const kp = {};
     if (pose) for (const k of pose.keypoints) if (k.name) kp[k.name] = k;
+    rawKp = Object.assign({}, kp);   // 管線動它之前先留一份
 
     // 先把關節點穩住，再去算刀刃 —— 肩、肘、腕三個點一起修，
     // 不然掌刀是從抓錯的手肘算出來的，怎麼平滑都沒用。
@@ -1942,27 +2022,23 @@
 
     const blades = { left: bladeFor('left', kp, now), right: bladeFor('right', kp, now) };
 
-    // 左右手混淆保護：模型在雙手交叉或重疊時會把左右互換，
-    // 那會產生一條橫跨畫面的假刀痕、憑空切掉一排水果。
-    // （posenet_fruit_ninja 用 leftRightMiniDistance 做同一件事。）
-    if (blades.left && blades.right) {
-      const apart = Math.hypot(blades.left.tx - blades.right.tx,
-                               blades.left.ty - blades.right.ty);
-      // 有量到身形就用身體尺度：兩隻手的掌刀不會靠得比一個前臂長還近
-      const near = calib && calib.forearm > 4
-        ? Math.max(px(F.lrMin), calib.forearm * 1.1) : px(F.lrMin);
-      if (apart < near) {
-        // 優先留「骨鏈成立」的那一隻 —— 鏈成立代表肩肘腕三點自洽，
-        // 比單看手腕分數可靠得多。兩邊同樣時才比分數。
-        const sl = (kp.left_wrist  && kp.left_wrist.score)  || 0;
-        const sr = (kp.right_wrist && kp.right_wrist.score) || 0;
-        // 到這裡兩邊都是鏈成立的刀（鏈不成立的在 bladeFor 就被擋掉了），
-        // 所以比手腕分數就好
-        if (sl >= sr) { blades.right = null; noBlade.right = '兩把掌刀太近 —— 手分開一點'; }
-        else          { blades.left  = null; noBlade.left  = '兩把掌刀太近 —— 手分開一點'; }
-        stats.lrRejects++;
-      }
-    }
+    // 「這是不是兩隻不同的手」只由 armsDistinct 判，而且只判一次。
+    //
+    // 這裡本來還有第二道：兩把掌刀靠得比 1.1 個前臂近就刪掉一把
+    // （posenet_fruit_ninja 的 leftRightMiniDistance）。拿掉的理由：
+    //
+    // 1) 它判的是**算出來的掌刀點**，而 armsDistinct 判的是**原始關節點**。
+    //    同一件事兩個地方判、兩套門檻、兩份資料 —— 兩邊一定會漂走。
+    //    原始關節點已經確定是兩條不共用點的鏈了，那兩把刀靠在一起
+    //    就只是「兩隻手靠在一起」，那是合法動作。
+    // 2) 雙手往中間揮是切水果最基本的動作，兩掌刀本來就會交會，
+    //    雙手合十更是 0px。實機一局量到這道觸發 2164 次，
+    //    每次都讓那隻手 prev 歸 null、整段筆畫作廢。
+    // 3) 它要防的「左右互換造成一條橫跨畫面的假刀痕」，
+    //    現在由 fixSides（運動連續性）＋ armsDistinct（兩條鏈不共用點）
+    //    ＋ SPRT 軌跡確認三道一起擋，而且都在原始座標上做。
+    //
+    // posenet_fruit_ninja 需要這道，是因為它只追手腕、沒有骨鏈驗證。
 
     let any = false;
     for (const side of SIDES) {
@@ -2000,6 +2076,7 @@
         prev[side] = null;
       }
     }
+    pipeKp = kp;                     // 管線實際用的那一份
     if (any) { stats.detFrames++; lastBladeAt = now; }
     if (!any) logNoBlade(now);
   }
@@ -2013,8 +2090,7 @@
   function logNoBlade(now) {
     if (now - lastDiagAt < 1000) return;
     lastDiagAt = now;
-    const raw = {};
-    if (lastPose) for (const k of lastPose.keypoints) if (k.name) raw[k.name] = k;
+    const raw = rawKp;
     const num = (v, d) => (v == null ? '—' : v.toFixed(d));
     const row = (sd) => {
       const e = evLast[sd] || {}, c = chainWhy[sd] || {};
@@ -2032,7 +2108,7 @@
         + ' | ' + (noBlade[sd] || '—');
     };
     console.log('[無刀] 門檻=' + MIN_SCORE.toFixed(2)
-      + ' 肘門檻=' + (MIN_SCORE * ELBOW_SCORE_MUL).toFixed(2)
+      + ' 肘門檻=' + scoreNeed('elbow').toFixed(2)
       + ' 校正前臂=' + (calib ? calib.forearm.toFixed(0) : '—')
       + ' 畫布=' + cv.width + 'x' + cv.height
       + ' 影像=' + video.videoWidth + 'x' + video.videoHeight
@@ -2177,8 +2253,9 @@
     if (ui.skel.checked && lastPose) {
       // 只畫手臂。這個遊戲只用到肩、肘、腕，
       // 臉上那些點畫出來只是雜訊，還會擋住自己的臉。
-      const kp = {};
-      for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
+      // 畫管線實際用的那一份 —— 骨架要跟刀刃講同一個故事，
+      // 不然會出現「骨架畫得好好的卻沒有刀」而看不出原因。
+      const kp = pipeKp;
       // 只連「相鄰」的兩個關節，而且兩端都要過門檻。
       //
       // 原本是先用 filter 把低分的點濾掉、再把剩下的依序連起來 ——
@@ -2190,7 +2267,7 @@
         const sh = kp[side + '_shoulder'], eb = kp[side + '_elbow'],
               wr = kp[side + '_wrist'];
         const ok = (k, part) => k && k.score >=
-          (part === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE);
+          scoreNeed(part);
         const shOK = ok(sh, 'shoulder'), ebOK = ok(eb, 'elbow'), wrOK = ok(wr, 'wrist');
         // 整條鏈成立（會用來算掌刀方向）→ 綠色；否則藍色，代表只能退化成單點
         const full = shOK && ebOK && wrOK && chainOK(sh, eb, wr, sw);
@@ -2405,15 +2482,14 @@
       : paused ? '分頁在背景' : demoMode ? phase + '（示範）' : phase;
     // 兩隻手各自的鏈現在成不成立，一眼看出是哪一邊有問題
     if (lastPose) {
-      const kp = {};
-      for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
+      const kp = pipeKp;
       const sw = shoulderWidth(kp);
       const mark = (side) => {
         const sh = kp[side + '_shoulder'], eb = kp[side + '_elbow'],
               wr = kp[side + '_wrist'];
         if (!wr || wr.score < MIN_SCORE) return '無手腕';
         if (!sh || !eb || sh.score < MIN_SCORE
-            || eb.score < MIN_SCORE * ELBOW_SCORE_MUL) return '只有腕';
+            || eb.score < scoreNeed('elbow')) return '只有腕';
         return chainOK(sh, eb, wr, sw) ? '成立' : '不合理';
       };
       ui.chain2.textContent = mark('left') + ' / ' + mark('right');
@@ -2484,8 +2560,16 @@
       ui.reset.disabled = false;
       enterReady();
     } catch (e) {
-      ui.start.disabled = false;
-      setStatus(e.message || String(e), true);
+      // 一定要回到 idle。
+      //
+      // 上面已經做過 phase = 'ready'; syncHint()，而 syncHint 在
+      // phase !== 'idle' 時會把提示框整個收起來 —— 唯一的「開啟相機」按鈕
+      // 就在那裡面。只把它 disabled = false 沒有用，它是 0×0 的。
+      // 而建立懸停圓圈的 enterReady() 在失敗路徑上永遠跑不到，
+      // 所以畫面上會變成「有影像、有文字、沒有任何能按的東西」。
+      // cameraLost() 早就做對了，這裡照抄同一套。
+      cameraLost(e.message || String(e));
+      ui.start.textContent = '再試一次';
     }
   });
 
@@ -2654,6 +2738,19 @@
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillStyle = '#e6e8ec';
     ctx.font = '600 22px -apple-system,"PingFang TC",sans-serif';
+
+    // 模型還沒載好就沒有圓圈（enterReady 才建立它）。
+    // 相機一好就先 phase='ready' 是刻意的 —— 要讓人馬上看到自己 ——
+    // 但畫面不能在這段時間叫他去停一個不存在的圓圈。
+    // 本機模型約 45ms，CDN 要 5–7 秒，後者使用者一定會遇到。
+    if (!detector) {
+      ctx.fillText('正在準備，稍等一下', cv.width / 2, cv.height * 0.30);
+      ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';
+      ctx.fillStyle = '#9aa3b2';
+      ctx.fillText('第一次開比較久，之後就快了', cv.width / 2, cv.height * 0.30 + 30);
+      return;
+    }
+
     ctx.fillText('把手停在圓圈上', cv.width / 2, cv.height * 0.30);
 
     ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';

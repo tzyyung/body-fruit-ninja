@@ -6,27 +6,17 @@
 // 沒有歷史 → 續=0 → 鏈✓續✗強✓ = −0.385（負的）→ Λ 釘死在下界 → 歷史再被清掉。
 // 使用者端實測 32 筆取樣全部 續=false(0.00)、Λ=−2.99 一動也不動，
 // 幾何完全正確也永遠爬不出來。
-const fs = require('fs');
-const path = require('path');
-const src = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
-const grab = (re, name) => {
-  const m = src.match(re);
-  if (!m) { console.error('抽不到 ' + name); process.exit(1); }
-  return m[0].replace(/^  function/, 'function');
-};
-const rhs = (re, name) => {
-  const code = grab(re, name);
-  return eval('(' + code.slice(code.indexOf('=') + 1).replace(/;\s*$/, '') + ')');
-};
+const H = require('./_harness.js');
+const { t, section, done } = H;
 
 const SPRT_ALPHA = 0.01, SPRT_BETA = 0.05;
 const SPRT_A = Math.log((1 - SPRT_BETA) / SPRT_ALPHA);
 const SPRT_B = Math.log(SPRT_BETA / (1 - SPRT_ALPHA));
-const EV = rhs(/  const EV = \{[\s\S]*?\n  \};/, 'EV');
-const llr = rhs(/  const llr = \(k, yes\) => \{[\s\S]*?\n  \};/, 'llr');
+const EV = eval(H.expr('EV'));
+const llr = eval(H.expr('llr'));
 const SIDES = ['left', 'right'];
 const ARM = ['shoulder', 'elbow', 'wrist'];
-const CHAIN_MEM_MS = Number(src.match(/const CHAIN_MEM_MS = (\d+)/)[1]);
+const CHAIN_MEM_MS = H.num('CHAIN_MEM_MS');
 let MIN_SCORE = 0.2;
 
 const track = { left: 0, right: 0 };
@@ -43,9 +33,9 @@ const shoulderWidth = () => 200;
 // 人站著不動 → 有歷史就接得上；沒有歷史一定是 0。
 const continuity = (side) => (chainHist[side] && scenario.still) ? 0.95 : 0;
 
-eval(grab(/  function latch\(side\) \{[\s\S]*?\n  \}/, 'latch'));
-eval(grab(/  function rememberChain\(side, kp, now\) \{[\s\S]*?\n  \}/, 'rememberChain'));
-eval(grab(/  function updateTracks\(kp, now\) \{[\s\S]*?\n  \}\n/, 'updateTracks'));
+eval(H.fn('latch'));
+eval(H.fn('rememberChain'));
+eval(H.fn('updateTracks'));
 
 const kpGood = () => {
   const o = {};
@@ -53,12 +43,6 @@ const kpGood = () => {
   return o;
 };
 
-let fails = 0;
-const t = (name, got, want) => {
-  const ok = JSON.stringify(got) === JSON.stringify(want);
-  if (!ok) fails++;
-  console.log((ok ? '  ok   ' : '  FAIL ') + name + '  期望 ' + want + ' 得到 ' + got);
-};
 const reset = () => {
   track.left = track.right = 0;
   confirmed.left = confirmed.right = false;
@@ -91,11 +75,29 @@ run(10);
 console.log('  10 幀後 Λ=' + track.left.toFixed(2) + ' confirmed=' + confirmed.left);
 t('被打到下界之後仍能恢復', confirmed.left, true);
 
-console.log('\n幾何一直不成立 —— 要往丟棄端走，不能確認');
+console.log('\n幾何一直不成立 —— 要真的抵達下界，不是停在附近慢慢爬');
 reset(); scenario = { chain: false, still: true };
 run(30);
-console.log('  30 幀後 Λ=' + track.left.toFixed(2) + ' confirmed=' + confirmed.left);
+console.log('  30 幀後 Λ=' + track.left.toFixed(4) + ' confirmed=' + confirmed.left);
 t('幾何不成立不該確認', confirmed.left, false);
+// 只斷言 confirmed===false 不夠。原本 Λ 停在 -2.95 而且每幀往上爬 +0.0014 ——
+// 看起來像「在下界」，其實是死區，15fps 下 370 秒會爬出來。
+t('Λ 要真的夾在下界（距離 < 0.01）',
+  Math.abs(track.left - SPRT_B) < 0.01, true);
+
+console.log('\n鏈不成立時，任何證據組合都必須是明確的負值');
+// 死區的來源：三項證據被當成條件獨立。幽靈鏈是用真手的點拼的，
+// 它既接得上上一幀（續✓）、手腕信心也高（強✓）——
+// 鏈✗續✓強✓ 曾經是 −2.639 +1.814 +0.827 = +0.0014，正的。
+{
+  let worstD = -Infinity, worstName = '';
+  for (const o of [true, false]) for (const g of [true, false]) {
+    const d = llr('chain', false) + (false ? llr('cont', o) : 0) + llr('strong', g);
+    if (d > worstD) { worstD = d; worstName = '續' + (o?'✓':'✗') + '強' + (g?'✓':'✗'); }
+  }
+  console.log('  鏈✗ 的最大增量：' + worstName + ' = ' + worstD.toFixed(4));
+  t('鏈✗ 時最大增量要明確為負（≤ −0.3）', worstD <= -0.3, true);
+}
 
 console.log('\n確認之後揮一刀（連續性斷掉幾幀）—— 不可以當場失去身分');
 reset(); scenario = { chain: true, still: true };
@@ -104,6 +106,29 @@ scenario = { chain: true, still: false };
 run(8);
 console.log('  揮 8 幀後 Λ=' + track.left.toFixed(2) + ' confirmed=' + confirmed.left);
 t('揮擊期間維持確認', confirmed.left, true);
+
+console.log('\n幾何持續不成立 —— 掃過整個狀態空間，一個都不准確認');
+// 原本的窮舉只掃 chain:true 那半邊，整個 chain:false 沒被測到。
+{
+  let bad = [];
+  for (let lam = SPRT_B; lam <= SPRT_A + 1e-9; lam += 0.25) {
+    for (const conf of [false, true]) {
+      reset();
+      track.left = track.right = lam;
+      confirmed.left = confirmed.right = conf;
+      rememberChain('left', kpGood(), 1000);
+      scenario = { chain: false, still: true };
+      let now = 1000;
+      for (let i = 0; i < 60; i++) { updateTracks(kpGood(), now); now += 33; }
+      if (confirmed.left || Math.abs(track.left - SPRT_B) > 0.01) {
+        bad.push('Λ0=' + lam.toFixed(2) + ' conf0=' + conf
+               + ' → Λ=' + track.left.toFixed(3) + ' conf=' + confirmed.left);
+      }
+    }
+  }
+  t('鏈不成立時，任何起始狀態都要在 60 幀內被丟棄到下界', bad.length, 0);
+  if (bad.length) console.log('    沒丟棄的：' + bad.slice(0, 5).join('、'));
+}
 
 console.log('\n沒有吸收態 —— 掃過整個狀態空間');
 
@@ -151,5 +176,4 @@ track.left = SPRT_B;
 updateTracks(kpGood(), 1000);
 t('Λ 在下界時仍要記下歷史', chainHist.left !== null, true);
 
-console.log(fails ? '\n' + fails + ' 項失敗' : '\n全部通過');
-process.exit(fails ? 1 : 0);
+done();

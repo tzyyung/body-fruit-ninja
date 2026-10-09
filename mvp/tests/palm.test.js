@@ -1,32 +1,14 @@
 // 掌刀的幾何：掌刀 = 手腕 + 0.4 × 前臂投影長 × (手腕−基準點 的單位向量)
 // 0.4 = 10cm ÷ 25cm 前臂。這是整個遊戲最核心的一條式子。
-const fs = require('fs');
-const path = require('path');
-const src = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
-const grab = (re, name) => {
-  const m = src.match(re);
-  if (!m) { console.error('抽不到 ' + name); process.exit(1); }
-  return m[0].replace(/^  function/, 'function');
-};
-const num = (name) => {
-  const m = src.match(new RegExp('const ' + name + '\\s*=\\s*([\\d.]+)'));
-  if (!m) { console.error('抽不到常數 ' + name); process.exit(1); }
-  return Number(m[1]);
-};
+const H = require('./_harness.js');
+const { t, section, near, done } = H;
 
-const FOREARM_CM = num('FOREARM_CM'), PALM_CM = num('PALM_CM'), TIP_CM = num('TIP_CM');
+const FOREARM_CM = H.num('FOREARM_CM'), PALM_CM = H.num('PALM_CM'), TIP_CM = H.num('TIP_CM');
 const PALM_K = PALM_CM / FOREARM_CM, TIP_K = TIP_CM / FOREARM_CM;
-const DIR_MIN_FOREARM = num('DIR_MIN_FOREARM');
-eval(grab(/  function palmPoint\(wrist, eb, sh, K, ref\) \{[\s\S]*?\n  \}/, 'palmPoint'));
+const DIR_MIN_FOREARM = H.num('DIR_MIN_FOREARM');
+eval(H.fn('palmPoint'));
 
 const P = (x, y) => ({ x, y });
-let fails = 0;
-const t = (name, got, want) => {
-  const ok = JSON.stringify(got) === JSON.stringify(want);
-  if (!ok) fails++;
-  console.log((ok ? '  ok   ' : '  FAIL ') + name + '  期望 ' + want + ' 得到 ' + got);
-};
-const near = (a, b, tol) => Math.abs(a - b) <= tol;
 
 console.log('前臂 ' + FOREARM_CM + 'cm　掌刀 +' + PALM_CM + 'cm　K = ' + PALM_K.toFixed(2)
           + '　指尖 +' + TIP_CM + 'cm　K = ' + TIP_K.toFixed(2));
@@ -94,5 +76,4 @@ r = palmPoint(P(300, 200), P(300, 400), P(250, 500), TIP_K, ref);
 t('指尖偏移 = 18/25 × 前臂', near(r.off, 200 * TIP_K, 1e-9), true);
 t('指尖比掌刀遠', TIP_K > PALM_K, true);
 
-console.log(fails ? '\n' + fails + ' 項失敗' : '\n全部通過');
-process.exit(fails ? 1 : 0);
+done();
