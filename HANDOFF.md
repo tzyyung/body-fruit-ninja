@@ -402,7 +402,12 @@ TF.js + MoveNet Lightning。
 4. `resetCalib()` 接上、`chk-small` 補 listener —— 代價比原本記的小
    （CUSUM 約 37 樣本會自癒），優先序低。
 
-5. 還沒量過的：WebGPU vs WebGL 的推論耗時差異。
+5. **還沒試的一條路：`@tensorflow/tfjs-tflite`**（WASM + XNNPACK 跑官方
+   per-channel int8 的 MoveNet）。理論上繞過整個量化問題，在 GPU 慢的
+   Android 上可能比 WebGL 快。但套件是 `0.0.1-alpha.10`、最後發布
+   2023-07，而且多執行緒要 COOP/COEP 而 GitHub Pages 不能設標頭。
+   要量過才算。見 `docs/METHOD.md` §5.2。
+6. 還沒量過的：WebGPU vs WebGL 的推論耗時差異。
    （uint8 與「縮圖再推論」都量完了，兩個都行不通，見 `docs/METHOD.md` §5.2 / §5.3b。）
    **沒量過不等於有問題**，而且量了可能發現不用改。要量就一次量完再決定，
    不要邊量邊改。

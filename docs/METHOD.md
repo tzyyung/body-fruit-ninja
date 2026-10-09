@@ -568,6 +568,15 @@ tfjs 預設從 `tfhub.dev` 抓模型，而那會重導到 Kaggle 拿簽章網址
 uint8 **一次都沒偵測到人**。遊戲整條「骨鏈成立 → SPRT 確認 → 掌刀」
 都掛在信心值上，所以表現出來就是手的游標完全不出現。
 
+#### 這是已知結果，不是本專案的發現
+
+**先講方法論上的錯**：下面整段是花了一小時逆推出來的，而它是文獻裡的
+教科書結果 —— 查兩分鐘就有。Krishnamoorthi（2018）的白皮書直接記了
+MobileNetV2 的 per-tensor 訓練後量化讓 ImageNet top-1 從 **70.9% 掉到 0.1%**，
+跟這裡「29 幀一次都沒抓到」是同一個現象。
+Nagel 等人（2019）進一步指出原因是**輸出通道之間的權重分布差太多，
+一組量化參數無法涵蓋整個張量**。
+
 #### 為什麼：per-tensor 量化殺死 depthwise 卷積
 
 一般卷積的每個輸出通道會看過所有輸入通道，權重的尺度被平均掉；
@@ -627,6 +636,37 @@ k=0.3 之下沒有任何張量的誤差超過 10%，**但輸出還是壞的**：
    不可能變大的指標，量了等於沒量。
 → 代理指標過關不等於功能正常。**最後一定要量真正的輸出**
    （這裡是模型的 keypoint 輸出），而且要有一個已知正確的對照組。
+
+#### 查證過的三件事（原本是我的斷言，現在有出處）
+
+| 原本的說法 | 查證結果 |
+|---|---|
+| 「tfjs 的反量化只吃 per-tensor」 | **成立。** 讀過 `tfjs-converter/python/tensorflowjs/quantization.py`：`quantize_weights()` 對整個 `data` 取一次 `min()`／`max()`，沒有任何 per-axis 的路徑 |
+| 「官方轉換器不能再量化 graph model」 | **成立。** 轉換器的格式矩陣裡 `tfjs_graph_model` 只出現在 **output** 欄；唯一能當 input 的 tfjs 格式是 `tfjs_layers_model` |
+| 「只能整個張量一起量化」 | **不完全對。** 官方的 `--quantize_uint8` 收的是**節點名稱清單**（可用萬用字元），也就是官方工具本來就支援選擇性量化。本專案的腳本後來用數值判準做了同一件事，但那條路實測仍然救不回來 |
+
+而 tfjs 版的 MoveNet 本來就是 float16 量化過的（本地 `model.json` 裡
+149 個浮點張量全部帶 `quantization: {dtype: 'float16'}`），**float16 就是
+這個執行環境能拿到的量化**。Google 有發佈 int8 的 MoveNet，但那是
+**TFLite** 版 —— TFLite 的轉換器對權重用 per-axis，所以它沒有這個問題。
+我查過 Kaggle 的 MoveNet 頁、TF Hub、以及 tfjs-models 的 pose-detection，
+**在這些範圍內沒有找到 tfjs 格式的 int8 版本**。
+
+#### 還沒試的一條路：在瀏覽器裡跑 TFLite
+
+`@tensorflow/tfjs-tflite` 用 WASM + XNNPACK 在瀏覽器裡跑 TFLite 模型，
+而 XNNPACK 對 int8 有加速。理論上可以直接用官方那個 per-channel 的
+int8 MoveNet，繞過整個問題，而且在 GPU 很慢的 Android 上**可能**比 WebGL 快。
+
+**但這條路有三個待確認的風險，沒量之前不要當成解法**：
+
+1. 套件版本是 `0.0.1-alpha.10`，最後發布 **2023-07-24** —— 三年沒動，
+   從來沒離開過 alpha（對照：`tfjs-core` 2024-10、`pose-detection` 2023-08）。
+2. WASM 多執行緒需要 `SharedArrayBuffer`，那要 COOP/COEP 標頭，
+   而 **GitHub Pages 不能設定標頭**。只能用單執行緒 SIMD。
+3. int8 + WASM 單執行緒會不會比 fp16 + WebGL 快，是裝置相依的，要量。
+
+#### 現況
 
 uint8 的選項與模型檔都已經從專案移除；`quantize.py` 留著讓實驗可重現
 （例如之後 tfjs 支援 per-channel 了），但產出的東西預設不會被用到。
@@ -820,7 +860,20 @@ CPU→GPU 的來回。
    — 手勢辨識的樣板比對family；本專案沒用它做分類，但借了「重取樣吸收速度差異」的想法。
 9. **Google.** [MoveNet model card](https://storage.googleapis.com/movenet/MoveNet.SinglePose%20Model%20Card.pdf),
    [TensorFlow.js pose-detection](https://github.com/tensorflow/tfjs-models/tree/master/pose-detection).
-10. 2-bone 解析 IK（餘弦定理 + swivel angle）：
+10. **Krishnamoorthi, R.** (2018).
+    [*Quantizing deep convolutional networks for efficient inference: A whitepaper*](https://arxiv.org/pdf/1806.08342).
+    — MobileNetV2 的 per-tensor 訓練後量化讓 top-1 從 70.9% 掉到 0.1%；
+    per-channel 是標準解法。本專案 §5.2 的現象就是這個。
+11. **Nagel, M., van Baalen, M., Blankevoort, T., Welling, M.** (2019).
+    [*Data-Free Quantization Through Weight Equalization and Bias Correction*](https://arxiv.org/pdf/1906.04721).
+    ICCV. — 說明為什麼 depthwise 的輸出通道之間分布差太多，
+    一組量化參數涵蓋不了整個張量。
+12. **TensorFlow.js.**
+    [`tfjs-converter/python/tensorflowjs/quantization.py`](https://github.com/tensorflow/tfjs/blob/master/tfjs-converter/python/tensorflowjs/quantization.py)
+    （per-tensor 的實作）、
+    [converter README 的格式矩陣](https://github.com/tensorflow/tfjs/blob/master/tfjs-converter/README.md)、
+    [`@tensorflow/tfjs-tflite`](https://www.npmjs.com/package/@tensorflow/tfjs-tflite)。
+13. 2-bone 解析 IK（餘弦定理 + swivel angle）：
     [3D 2-Bone Inverse Kinematics](https://timallanwheeler.com/blog/2024/09/28/3d-2-bone-inverse-kinematics/)。
 
 ---
