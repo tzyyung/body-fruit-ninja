@@ -352,7 +352,8 @@ TF.js + MoveNet Lightning。
 - `tests/singlesource.test.js` —— **機械檢查**：單一來源、接線、
   門檻比較走容差、用到 `now` 一定要有 `now`。這檔抓到過好幾個真問題。
 - `docs/METHOD.md` —— 方法與量測，每個數字都附來源
-- 全域 skill：`read-the-running-system`、`corpus-driven-tuning`
+- `.claude/skills/` —— 兩份專案 skill（內容整份都在講這個專案，
+  所以跟著 repo 走，不放全域）：`read-the-running-system`、`corpus-driven-tuning`
 
 ## 6. 建議的下一步
 
@@ -396,8 +397,8 @@ TF.js + MoveNet Lightning。
 這一輪抓到的每一個真 bug 都是先讀數字才找到的 ——
 而猜的那幾次（肩膀錨點、SLASH_FOREARM）全部被資料否決。
 
-**全域 skill 也寫好了**：`read-the-running-system`（先讀跑起來的那個）、
-`corpus-driven-tuning`（用語料訂規則，不要叫使用者再試一次）。
+**專案 skill 也寫好了**（在 `.claude/skills/`）：`read-the-running-system`
+（先讀跑起來的那個）、`corpus-driven-tuning`（用語料訂規則，不要叫使用者再試一次）。
 
 每一批照 `CLAUDE.md` §1 的流程：`git diff` → 改 → `menu.sh check` →
 單元測試（純邏輯用 node）→ 瀏覽器零錯誤 → 量版面 → 截圖看 → commit。

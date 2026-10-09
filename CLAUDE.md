@@ -17,6 +17,7 @@ docs/METHOD.md   方法與量測（像論文那樣寫：理論、公式、為什
 docs/DEV.md      這裡有什麼、怎麼跑、各項預設值與理由
 HANDOFF.md       現況與待辦
 README.md        給第一次看到這個 repo 的人
+.claude/skills/  兩份專案 skill：先讀跑起來的那個、用語料訂規則
 ```
 
 **要改演算法或門檻之前先讀 `docs/METHOD.md`。** 那裡面每個數字都有來源 ——
