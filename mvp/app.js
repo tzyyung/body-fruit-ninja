@@ -215,6 +215,10 @@
   // 畫面上三個關節分數全綠、卻看不到手掌時，使用者只能猜是自己站錯還是程式壞了 ——
   // 而真正的原因（鏈沒確認、被另一手蓋掉）根本不在那三個數字裡。
   const noBlade = { left: '', right: '' };
+
+  // 這一幀三項證據各自成不成立。軌跡確認不了的時候，
+  // 光看 Λ 這個數字不知道是哪一項在扣分。
+  const evLast = { left: null, right: null };
   const boneMed = {};           // 骨頭名 → 長度中位數用的樣本
   let stats = freshStats();
 
@@ -498,9 +502,11 @@
         if (!confirmed[side]) chainHist[side] = null;
         continue;
       }
-      const d = llr('chain',  chainOK(sh, eb, wr, shoulderWidth(kp)))
-              + llr('cont',   continuity(side, kp, now) > 0.25)
-              + llr('strong', wr.score >= MIN_SCORE * 1.5);
+      const okChain  = chainOK(sh, eb, wr, shoulderWidth(kp), side);
+      const okCont   = continuity(side, kp, now) > 0.25;
+      const okStrong = wr.score >= MIN_SCORE * 1.5;
+      evLast[side] = { chain: okChain, cont: okCont, strong: okStrong };
+      const d = llr('chain', okChain) + llr('cont', okCont) + llr('strong', okStrong);
       track[side] = Math.min(SPRT_A, Math.max(SPRT_B, track[side] + d));
       latch(side);
       if (!confirmed[side] && track[side] <= SPRT_B) chainHist[side] = null;
@@ -536,9 +542,20 @@
   // 擋掉錯配的工作改由上界 + armsDistinct（兩條鏈不能共用點）負責。
   // 實測先前漏掉的「手肘是另一隻手的」案例（上臂 230px / 肩寬 120px = 1.9）
   // 單靠上界就擋得下來。
-  function chainOK(sh, eb, wr, shoulderW) {
+  // 上一次判斷用到的實際比值。鏈不成立時畫在螢幕上 ——
+  // 只看 true/false 沒辦法知道是差一點還是差很多，也沒辦法知道是哪一道擋的。
+  const chainWhy = { left: null, right: null };
+
+  function chainOK(sh, eb, wr, shoulderW, side) {
     const upper = Math.hypot(sh.x - eb.x, sh.y - eb.y);
     const fore  = Math.hypot(eb.x - wr.x, eb.y - wr.y);
+    if (side) {
+      chainWhy[side] = {
+        upper, fore, shoulderW,
+        rU: shoulderW > 4 ? upper / shoulderW : null,
+        rF: (calib && calib.forearm > 4) ? fore / calib.forearm : null,
+      };
+    }
     // 只用「單一線段的絕對長度上界」。
     //
     // 不能用「前臂/上臂的比值」—— 投影會獨立影響兩段：手肘收在身側、
@@ -1215,6 +1232,22 @@
     if (why.length) {
       ctx.fillStyle = '#fbbf24';
       why.forEach((line, i) => ctx.fillText(line, cv.width / 2, y + 18 + i * 17));
+      // 軌跡確認不了是最難從外面看出原因的一種 —— 把證據攤開。
+      // 這一行是給開發者看的儀器，跟上面給玩家的提示分開。
+      const ev = SIDES.map((sd) => {
+        const e = evLast[sd], c = chainWhy[sd];
+        if (!e) return (sd === 'left' ? '左' : '右') + ' —';
+        const f = (k, ok) => (ok ? '' : '✗') + k;
+        const r = c ? ' 上/肩 ' + (c.rU == null ? '—' : c.rU.toFixed(2))
+                    + ' 前/校 ' + (c.rF == null ? '—' : c.rF.toFixed(2)) : '';
+        return (sd === 'left' ? '左' : '右') + ' Λ' + track[sd].toFixed(1)
+             + ' ' + f('鏈', e.chain) + f('續', e.cont) + f('強', e.strong) + r;
+      });
+      ctx.fillStyle = '#9aa3b2';
+      ctx.font = '400 11px ui-monospace,Menlo,monospace';
+      ev.forEach((line, i) =>
+        ctx.fillText(line, cv.width / 2, y + 18 + why.length * 17 + i * 14));
+      ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
     } else {
       ctx.fillStyle = '#9aa3b2';
       ctx.fillText('肩膀、手肘、手腕三點都要進畫面，掌刀才算得出來',
