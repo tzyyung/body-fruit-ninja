@@ -61,7 +61,7 @@ model.json 當樣本也會選錯，那量到的是冷啟）。線上實測輸家
 ```
 
 ```sh
-./menu.sh test                    # 單元測試（14 檔 249 條）
+./menu.sh test                    # 單元測試（14 檔 246 條）
 node tests/bdd.js                 # 驗收條件（36 個 Gherkin 場景）
 ./menu.sh pwlog '關鍵字'          # 看瀏覽器 console（最新那個檔，自動修剪）
 codegraph query / callers / impact  # 查程式，比 grep 準
@@ -305,7 +305,10 @@ TF.js + MoveNet Lightning。
 
 - **WebGPU vs WebGL**（面板可切換，看「推論耗時中位數」）。
   TF.js 官方宣稱 3 倍，M4 上未驗證。
-- **uint8 量化對真人影像的精度影響**（面板有「比對 fp16 / uint8」按鈕）。
+- ~~uint8 量化對真人影像的精度影響~~ **2026-10-09 量完了：行不通。**
+  真機 29 幀裡 uint8 一次都沒偵測到人（fp16 只漏 1 次）。
+  原因是 per-tensor 量化殺死 depthwise 卷積，而 tfjs 只支援 per-tensor。
+  選項與模型檔都已移除，`quantize.py` 留著讓實驗可重現。見 `docs/METHOD.md` §5.2。
   合成圖上信心掉一半，但那張圖連基準模型都認不出來，結論不可信。
 - **「縮圖再推論」到底有沒有比較快**（開關做好了，沒量過）。
 
@@ -399,7 +402,8 @@ TF.js + MoveNet Lightning。
 4. `resetCalib()` 接上、`chk-small` 補 listener —— 代價比原本記的小
    （CUSUM 約 37 樣本會自癒），優先序低。
 
-5. 還沒量過的三個（WebGPU vs WebGL、uint8 對真人影像的精度、縮圖再推論）。
+5. 還沒量過的：WebGPU vs WebGL 的推論耗時差異。
+   （uint8 與「縮圖再推論」都量完了，兩個都行不通，見 `docs/METHOD.md` §5.2 / §5.3b。）
    **沒量過不等於有問題**，而且量了可能發現不用改。要量就一次量完再決定，
    不要邊量邊改。
 

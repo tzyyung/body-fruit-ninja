@@ -168,10 +168,6 @@
       dir: 'models/movenet-lightning', bytes: 4818229,
       files: ['model.json', 'group1-shard1of2.bin', 'group1-shard2of2.bin'],
       race: 'group1-shard1of2.bin' },
-    'movenet-lightning-uint8': { kind: 'movenet', modelType: 'SINGLEPOSE_LIGHTNING',
-      dir: 'models/movenet-lightning-uint8', bytes: 2500414,
-      files: ['model.json', 'group1-shard1of1.bin'],
-      race: 'group1-shard1of1.bin' },
     'movenet-thunder':   { kind: 'movenet',   modelType: 'SINGLEPOSE_THUNDER',
       dir: 'models/movenet-thunder', bytes: 12645263,
       files: ['model.json', 'group1-shard1of3.bin', 'group1-shard2of3.bin',
@@ -305,7 +301,7 @@
   // 「這個模型的 model.json 在哪」—— 唯一的入口。
   // 回 null 表示抓不到任何來源，呼叫端就不要給 modelUrl，讓 tfjs 自己去 tfhub。
   // 面板上的比較按鈕也一定要走這裡：寫死 'models/...' 的話在 GitHub Pages
-  // 上就是 43KB/s，比對 fp16/uint8 要抓 7MB、三組設定要抓 17MB。
+  // 上就是 43KB/s，而「比較三組偵測設定」要抓 17MB（含 12MB 的 Thunder）。
   const modelHref = (key) => prefetchModel(key);
 
   // 每個模型各自記。共用一個槽位的話，面板那兩個比較按鈕輪流要三個模型
@@ -394,7 +390,7 @@
     backend:el('m-backend'), src:el('m-src'), tensors:el('m-tensors'),
     status:el('status'), hint:el('hint'),
     start:el('btn-start'), reset:el('btn-reset'), demo:el('btn-demo'),
-    cmp:el('btn-cmp'), probe:el('btn-probe'), result:el('result'),
+    probe:el('btn-probe'), result:el('result'),
     again:el('btn-again'),
     backendSel:el('sel-backend'), model:el('sel-model'), bladeSel:el('sel-blade'),
     smooth:el('chk-smooth'), skel:el('chk-skel'), scoreSel:el('sel-score'),
@@ -3476,132 +3472,6 @@
     if (!running) { running = true; startLoops(); }
   });
 
-  // 量化到底傷了多少，只有用真人影像量才算數。
-  // 合成的假人連基準模型自己都認不出來，拿那種輸入比等於在比雜訊。
-  ui.cmp.addEventListener('click', async () => {
-    if (!video.videoWidth) { setStatus('要先按「開始」把相機打開。', true); return; }
-    ui.cmp.disabled = true;
-    // 遊戲迴圈先停，不然它會跟量測搶 GPU、也會把覆蓋層蓋掉。
-    // 停了之後畫面就只剩這裡畫的東西 —— 所以一定要畫。
-    const resume = pauseForMeasure();
-    const ARM = ['left_shoulder','right_shoulder','left_elbow','right_elbow',
-                 'left_wrist','right_wrist'];
-    let a = null, b = null;
-    try {
-      setStatus('載入兩個模型…');
-      drawMeasuring('正在載入兩個模型', 1, 1, 0);
-      // url 可能是 null（所有來源都抓不到）。null 不能丟給 tfjs ——
-      // 它會當成一個網址去抓，要整個不給 modelUrl 才會回去用 tfhub。
-      const mk = (url) => poseDetection.createDetector(
-        poseDetection.SupportedModels.MoveNet,
-        Object.assign(
-          { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
-            enableSmoothing: false, minPoseScore: 0.2 },
-          url ? { modelUrl: url } : null));
-      a = await mk(await modelHref('movenet-lightning'));
-      b = await mk(await modelHref('movenet-lightning-uint8'));
-
-      const dArm = [], dAll = [], sA = [], sB = [];
-      let frames = 0, missA = 0, missB = 0;
-      const until = performance.now() + 5000;
-      setStatus('揮動手臂五秒，正在比對…');
-      while (performance.now() < until) {
-        drawMeasuring('正在比對 fp16 / uint8', until - performance.now(), 5000, frames);
-        const pa = (await a.estimatePoses(video, { flipHorizontal:false }))[0];
-        const pb = (await b.estimatePoses(video, { flipHorizontal:false }))[0];
-        frames++;
-        if (!pa) { missA++; }
-        if (!pb) { missB++; }
-        if (!pa || !pb) continue;
-        for (let i = 0; i < pa.keypoints.length; i++) {
-          const ka = pa.keypoints[i], kb = pb.keypoints[i];
-          const d = dist(ka, kb);
-          dAll.push(d);
-          if (ARM.includes(ka.name)) { dArm.push(d); sA.push(ka.score); sB.push(kb.score); }
-        }
-      }
-      const srt = (v) => [...v].sort((x,y)=>x-y);
-      const q = (v,p) => v.length ? srt(v)[Math.floor(v.length*p)] : NaN;
-      const avg = (v) => v.length ? v.reduce((s,n)=>s+n,0)/v.length : NaN;
-
-      if (!dArm.length) {
-        // 這條路上不能只說「沒抓到」。missA / missB 就在手邊，而那才是答案：
-        //   frames 是 0      → 一輪都沒跑完，是速度問題不是站位
-        //   兩邊都抓不到      → 人真的沒進畫面
-        //   只有 uint8 抓不到 → 這就是要比的那件事，直接給結論
-        // 原本一律回「站進畫面、讓手肘也入鏡」—— 把答案丟掉，還怪使用者站錯。
-        let why, tone = 'warn';
-        if (frames === 0) {
-          why = '五秒內一輪都沒跑完，推論比五秒還慢。換成 WebGPU 再試一次。';
-        } else if (missA >= frames && missB >= frames) {
-          why = '兩個模型都完全看不到人。站進畫面、讓肩膀手肘手腕都入鏡，再按一次。';
-        } else if (missB > missA) {
-          why = 'fp16 抓得到、uint8 抓不到 —— 這就是答案：uint8 在這台裝置上'
-              + '偵測不到人，不要用它。';
-          tone = 'bad';
-        } else if (missA > missB) {
-          why = 'uint8 抓得到、fp16 抓不到。這很反常，再按一次確認。';
-        } else {
-          why = '兩邊各自都抓到過，但沒有同時抓到。手不要移出畫面，再按一次。';
-        }
-        showResult([
-          ['跑了幾輪',     String(frames)],
-          ['fp16 抓不到',  missA + ' / ' + frames],
-          ['uint8 抓不到', missB + ' / ' + frames],
-        ], why, tone);
-        setStatus('沒量到可以比的幀，原因在下面。', true);
-        return;
-      }
-
-      const medArm = q(dArm, 0.5), p95Arm = q(dArm, 0.95);
-      const cA = avg(sA), cB = avg(sB);
-      const lostA = missA / frames, lostB = missB / frames;
-
-      // 判讀基準：掌刀是從手腕和手肘算出來的，誤差會被放大 1.4 倍，
-      // 而命中半徑約 41.6px。所以關節點差 5px → 刀刃差 7px，
-      // 只佔命中半徑的 17%，切不切得到不會變；差 15px 就開始有感。
-      let verdict, tone;
-      if (lostB > lostA + 0.15) {
-        verdict = 'uint8 掉追蹤的機率明顯比較高（' + (lostA*100).toFixed(0) + '% → '
-          + (lostB*100).toFixed(0) + '%）。這比位置誤差更傷，建議留在 fp16。';
-        tone = 'bad';
-      } else if (medArm < 5) {
-        verdict = '手臂關節點中位只差 ' + medArm.toFixed(1)
-          + 'px，換算到刀刃約 ' + (medArm*1.4).toFixed(1)
-          + 'px，不到命中半徑的兩成 —— 玩起來不會有差別。可以用 uint8。';
-        tone = 'good';
-      } else if (medArm < 15) {
-        verdict = '中位差 ' + medArm.toFixed(1) + 'px、p95 差 ' + p95Arm.toFixed(1)
-          + 'px。多半感覺不出來，但快揮時的刀痕會比較不穩。想省體積就用，'
-          + '想要最穩就留 fp16。';
-        tone = 'warn';
-      } else {
-        verdict = '中位就差 ' + medArm.toFixed(1) + 'px，換算到刀刃約 '
-          + (medArm*1.4).toFixed(1) + 'px，接近命中半徑的一半 —— '
-          + '會切不準。建議留在 fp16。';
-        tone = 'bad';
-      }
-
-      showResult([
-        ['比對幀數',          String(frames)],
-        ['手臂關節點差 中位', medArm.toFixed(1) + ' px'],
-        ['手臂關節點差 p95',  p95Arm.toFixed(1) + ' px'],
-        ['全部關節點差 中位', q(dAll,0.5).toFixed(1) + ' px'],
-        ['手臂信心 fp16',     cA.toFixed(3)],
-        ['手臂信心 uint8',    cB.toFixed(3)],
-        ['抓不到的幀 fp16',   (lostA*100).toFixed(0) + '%'],
-        ['抓不到的幀 uint8',  (lostB*100).toFixed(0) + '%'],
-      ], verdict, tone);
-      setStatus('比對完成，結果在下面。');
-    } catch (e) {
-      setStatus('比對失敗：' + e.message, true);
-    } finally {
-      if (a && a.dispose) a.dispose();
-      if (b && b.dispose) b.dispose();
-      ui.cmp.disabled = false;
-      resume();   // 一定要在 finally —— 中途丟錯的話迴圈就再也不會回來
-    }
-  });
 
   // 看得到自己、但遊戲還沒開始。站好位置，再把手停到圓圈上。
   // 提示框只在還沒開相機時出現。散在各條路徑裡手動開關，
@@ -3722,10 +3592,12 @@
     beginPlay();
   }
 
-  function showResult(rows, verdict, tone) {
+  // 標題要由呼叫端給。原本寫死成某一個比較的名字，但另一個比較也用同一支
+  // —— 按下去會看到完全無關的標題。
+  function showResult(title, rows, verdict, tone) {
     const dl = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
     const cls = tone ? ' class="' + tone + '"' : '';
-    ui.result.innerHTML = '<h3>fp16 與 uint8 的差異</h3><dl>' + dl + '</dl>'
+    ui.result.innerHTML = '<h3>' + title + '</h3><dl>' + dl + '</dl>'
       + '<div class="verdict"' + cls + '>' + verdict + '</div>';
     ui.result.hidden = false;
   }
@@ -3818,7 +3690,7 @@
       console.log('手腕位置是畫面比例：x 0=左 1=右，y 0=上 1=下（未鏡像，相機原始座標）');
       console.log(JSON.stringify(rows, null, 2));
 
-      showResult(rows.map((r) => [r.設定.slice(0, 16),
+      showResult('三組偵測設定的比較', rows.map((r) => [r.設定.slice(0, 16),
         '腕 ' + (r.最佳手腕分數 ?? '—') + '　(' + (r.手腕位置x ?? '?') + ', '
         + (r.手腕位置y ?? '?') + ')']),
         '完整數字在主控台（F12 → Console），用 console.table 印成表格了。'

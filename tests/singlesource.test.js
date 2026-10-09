@@ -197,33 +197,15 @@ t('drawReady 不拿 detector 當有沒有圓圈的依據',
   /\bdetector\b/.test(body('drawReady')), false);
 t('drawReady 問的是 hoverBtns', /hoverBtns/.test(body('drawReady')), true);
 
-section('量測失敗時要印出數字，不要只說失敗');
-
-// 2026-10-09：使用者按了比對，得到「五秒內沒同時抓到兩邊的手臂」。
-// 那句話把答案丟掉了 —— missA / missB（兩邊各自抓不到幾次）就在手邊，
-// 而那正好能區分「人沒進畫面」和「uint8 偵測不到人」，後者就是當時要查的事。
-// CLAUDE.md §5：抓不到東西時不能沉默，要把數字印出來。
-{
-  const fail = code.slice(code.indexOf('if (!dArm.length)'),
-                          code.indexOf('if (!dArm.length)') + 1600);
-  t('失敗時有印跑了幾輪', /\['跑了幾輪'/.test(fail), true);
-  t('失敗時有印 fp16 抓不到幾次', /missA \+ ' \/ ' \+ frames/.test(fail), true);
-  t('失敗時有印 uint8 抓不到幾次', /missB \+ ' \/ ' \+ frames/.test(fail), true);
-  t('會分辨出「只有 uint8 抓不到」', /missB > missA/.test(fail), true);
-  t('會分辨出「一輪都沒跑完」', /frames === 0/.test(fail), true);
-}
-
 section('量測期間畫面不准沉默');
 
-// 2026-10-09 使用者回報「比對 fp16/uint8 按下去卡住 5 秒、沒有手部圈圈」。
-// 那 5 秒是設計好的量測窗，手部圈圈不出現也是對的（跑的是比對用的臨時
+// 2026-10-09 使用者回報「按下去卡住 5 秒、沒有手部圈圈」。
+// 那 5 秒是設計好的量測窗，手部圈圈不出現也是對的（跑的是量測用的臨時
 // 模型，遊戲自己的追蹤沒在更新）—— 但它跟「壞掉」長得一模一樣。
-// 兩個比較按鈕都必須：停掉遊戲迴圈、自己畫、而且在 finally 裡復原。
+// 會佔住 GPU 的量測都必須：停掉遊戲迴圈、自己畫、而且在 finally 裡復原。
 {
-  const cmp = code.slice(code.indexOf("ui.cmp.addEventListener"),
-                         code.indexOf("ui.probe.addEventListener"));
   const probe = code.slice(code.indexOf("ui.probe.addEventListener"));
-  for (const [name, blk] of [['比對 fp16/uint8', cmp], ['比較三組設定', probe]]) {
+  for (const [name, blk] of [['比較三組設定', probe]]) {
     t(name + ' 會停掉遊戲迴圈', /const resume = pauseForMeasure\(\);/.test(blk), true);
     t(name + ' 迴圈裡每一輪都畫', /while \(performance\.now\(\) < until\) \{\s*\n\s*drawMeasuring\(/.test(blk), true);
     // 中途丟錯的話迴圈就再也不會回來，所以復原一定要在 finally
@@ -239,9 +221,9 @@ section('量測期間畫面不准沉默');
 
 section('模型網址只能從一個地方來');
 
-// 面板上的兩個比較按鈕原本寫死 'models/xxx/model.json'，繞過來源賽跑 ——
-// 在 GitHub Pages 上那是 43KB/s，比對 fp16/uint8 要抓 7MB、
-// 三組設定要抓 17MB（含 12MB 的 thunder）。等於按下去就當掉。
+// 面板上的比較按鈕原本寫死 'models/xxx/model.json'，繞過來源賽跑 ——
+// 在 GitHub Pages 上那是 43KB/s，「比較三組偵測設定」要抓 17MB
+//（含 12MB 的 thunder）。等於按下去就當掉。
 t('modelHref 只有一個定義', count('const modelHref ='), 1);
 // MODELS 的 dir 是三筆；除此之外不准再出現寫死的模型路徑
 t('沒有寫死的 model.json 路徑',
@@ -252,7 +234,7 @@ t('沒有寫死的 model.json 路徑',
   const all = (code.match(/modelUrl: url/g) || []).length;
   const guarded = (code.match(/url \? \{ modelUrl: url \} : null/g) || []).length;
   t('每個 modelUrl: url 都在守衛裡', all - guarded, 0);
-  t('兩個比較按鈕都有守衛', guarded, 2);
+  t('比較按鈕的 modelUrl 有守衛', guarded, 1);
 }
 
 section('懸停圓圈用比例存，不要存像素');

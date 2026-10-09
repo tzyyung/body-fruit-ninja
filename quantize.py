@@ -18,6 +18,19 @@ from pathlib import Path
 import numpy as np
 
 SHARD_BYTES = 4 * 1024 * 1024
+# 一階量化步距超過「典型權重量級」的這個倍數就不量化，原樣保留 float16。
+#
+# 掃出來的（對 movenet-lightning，誤差＝典型權重被改動的中位比例）：
+#   門檻   體積        佔原模型  跳過  最糟張量   >10% 的張量
+#   2.0    2,503,353     52%      2     45.0%        8
+#   1.0    2,517,334     52%      5     20.3%        5
+#   0.5    2,533,078     53%      9     12.2%        1
+#   0.3    2,597,892     54%     12      7.0%        0   ← 選這個
+#   0.2    2,611,572     54%     17      5.1%        0
+#
+# 1.0 → 0.3 只多 80KB（52% → 54%），但最糟誤差從 20.3% 掉到 7.0%，
+# 而且沒有任何張量超過 10%。省那 80KB 不值得冒毀掉一層的風險。
+KEEP_IF_STEP_OVER = 0.3
 RAW_BYTES = {'float32': 4, 'int32': 4, 'bool': 1, 'uint8': 1,
              'uint16': 2, 'float16': 2, 'complex64': 8}
 
@@ -51,7 +64,8 @@ def requantize(src_dir: Path, dst_dir: Path):
 
     out_bytes = bytearray()
     new_manifest = []
-    worst = []          # (相對誤差, 名稱)
+    worst = []          # (步距/典型量級, 名稱)
+    skipped = []        # 動態範圍太大、原樣保留的
     kept, converted = 0, 0
 
     for group in model['weightsManifest']:
@@ -72,6 +86,28 @@ def requantize(src_dir: Path, dst_dir: Path):
 
             lo = float(vals.min()) if vals.size else 0.0
             hi = float(vals.max()) if vals.size else 0.0
+
+            # 整張量統一量化，碰到動態範圍很大的張量就會把小權重全部碾平。
+            # 判準：一階量化步距有沒有大過「典型權重的量級」。
+            #
+            # MobileNetV2 的 depthwise 權重正是這一族（逐通道的尺度差很多），
+            # 實測 5 個張量的步距是典型權重的 1.5–5.8 倍 —— 那幾層等於被毀掉。
+            # 2026-10-09 真機量到的後果：uint8 在 29 幀裡**一次都沒偵測到人**，
+            # 同樣那 29 幀 fp16 只漏 1 次。
+            #
+            # 這 5 個只佔全部權重的 0.74%（17,136 個元素），原樣保留只多 17KB。
+            # 正解是 per-channel 量化（TFLite 對 depthwise 就是這樣做），
+            # 但那要改 tfjs 的反量化路徑；這裡用「跳過」換 0.7% 的體積。
+            nz = np.abs(vals) > 0
+            typical = float(np.median(np.abs(vals[nz]))) if nz.any() else 0.0
+            step = (hi - lo) / 255.0
+            if typical > 0 and step > typical * KEEP_IF_STEP_OVER:
+                out_bytes += vals.astype(np.float16).tobytes()
+                new['quantization'] = {'dtype': 'float16', 'original_dtype': 'float32'}
+                skipped.append((step / typical, spec['name']))
+                new_specs.append(new)
+                continue
+
             if hi == lo:
                 # 常數張量：scale 給 1，全部存 0，還原時 0*1+min = min
                 scale = 1.0
@@ -80,10 +116,11 @@ def requantize(src_dir: Path, dst_dir: Path):
                 scale = (hi - lo) / 255.0
                 q = np.clip(np.rint((vals - lo) / scale), 0, 255).astype(np.uint8)
 
-            back = q.astype(np.float32) * scale + lo
-            span = hi - lo
-            if span > 0:
-                worst.append((float(np.abs(back - vals).max() / span), spec['name']))
+            # 不要報「誤差佔值域的比例」—— 那永遠是半個量化階（0.196%），
+            # 不管模型有沒有壞都一樣，等於量了一個不會變的數字。
+            # 要報的是「一階步距相對於典型權重有多大」。
+            if typical > 0:
+                worst.append((step / typical, spec['name']))
 
             out_bytes += q.tobytes()
             new['quantization'] = {'dtype': 'uint8', 'original_dtype': 'float32',
@@ -108,12 +145,17 @@ def requantize(src_dir: Path, dst_dir: Path):
     src_sz = sum(f.stat().st_size for f in src_dir.iterdir() if f.is_file())
     dst_sz = sum(f.stat().st_size for f in dst_dir.iterdir() if f.is_file())
     worst.sort(reverse=True)
-    print(f'  張量 {converted} 個轉成 uint8、{kept} 個原樣保留')
+    skipped.sort(reverse=True)
+    print(f'  張量 {converted} 個轉成 uint8、{kept} 個非 float32 原樣保留、'
+          f'{len(skipped)} 個動態範圍太大保留 float16')
     print(f'  {src_sz:,} → {dst_sz:,} bytes  ({100 * dst_sz / src_sz:.0f}%)')
-    print(f'  量化誤差（佔該張量值域的比例）')
-    print(f'    最大 {worst[0][0] * 100:.3f}%   中位 '
-          f'{worst[len(worst) // 2][0] * 100:.3f}%')
-    print(f'    最差的張量：{worst[0][1][:70]}')
+    print(f'  量化步距 / 典型權重量級（> 1 就是把小權重碾平，必須跳過）')
+    if worst:
+        print(f'    有量化的裡面最大 {worst[0][0]:.2f}   中位 '
+              f'{worst[len(worst) // 2][0]:.2f}')
+        print(f'    最大的那個：{worst[0][1][-60:]}')
+    for r, n in skipped:
+        print(f'    跳過 {r:5.2f}  {n[-60:]}')
 
 
 if __name__ == '__main__':

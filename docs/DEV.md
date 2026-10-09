@@ -48,54 +48,26 @@ tfjs 預設從 `tfhub.dev` 抓模型，而那會重導到 Kaggle 拿簽章網址
 
 用不到 Thunder 的話 `rm -rf models/movenet-thunder` 就好。
 
-### 量化（uint8）
+### 量化（uint8）—— 量過了，行不通
 
-模型**本來就已經是 float16 量化過的**（`model.json` 裡 149 個浮點張量
-全部帶 `quantization: {dtype: 'float16'}`），所以再轉 uint8 只會再少一半，
-不是 1/4。
+模型**本來就已經是 float16 量化過的**，所以再轉 uint8 只會再少一半。
+自己寫了一支 `quantize.py`（官方轉換器只支援 `tfjs_layers_model`）：
 
 ```sh
 ./menu.sh quantize       # 產生 models/movenet-lightning-uint8
 ```
 
-`quantize.py` 自己寫的，因為官方 `tensorflowjs_converter` 的再量化只支援
-`tfjs_layers_model`，而 MoveNet 是 `graph-model`；而且它會拉進
-TensorFlow + JAX 幾 GB 的相依。算式取自 tfjs-core 的 `decodeWeight()`：
+體積確實減半（4.82MB → 2.50MB），推論也略快（9.4ms → 8.6ms）。
+**但模型偵測不到人。** 真機 29 幀裡 uint8 一次都沒抓到，同樣那 29 幀
+fp16 只漏 1 次。
 
-```
-反量化：v = q * scale + min
-量化：  scale = (max - min) / 255,  q = round((v - min) / scale)
-metadata: {dtype:'uint8', original_dtype:'float32', scale, min}
-```
+原因是 per-tensor 量化（整個張量共用一組 min/max）殺死了 depthwise
+卷積 —— 那種層每個通道的尺度各自獨立，範圍被最大的通道撐開之後，
+一階量化步距比典型權重還大 1.5–5.8 倍。TFLite 對 depthwise 用
+per-channel 就是為了這個，而 tfjs 的反量化只吃 per-tensor。
 
-結果：
-
-| | 體積 | 建立 detector | 推論中位數 |
-|---|---|---|---|
-| float16（原始） | 4.82 MB | 45ms | 9.4ms |
-| uint8 | **2.50 MB（52%）** | 24ms | 8.6ms |
-
-張量層級的量化誤差最大 0.196%（= 1/(2×255)，半個量化階，理論最小值）。
-
-**但精度影響還沒有定論。** 用合成假人量到 uint8 的信心只剩基準的一半
-（0.143 → 0.067），那是真的退化訊號；可是基準模型自己對那張圖的信心也只有
-0.14，等於在比兩團雜訊，位移數字不可信。
-
-要真的答案就按頁面上的**「比對 fp16 / uint8」**：它會用你的即時影像同時跑兩個
-模型五秒，輸出手臂關節點的位移中位數／p95 和信心差。真人影像才算數。
-
-### 為什麼不壓縮
-
-量過了，不值得：
-
-| | 原始 | gzip | 比率 |
-|---|---|---|---|
-| 權重 `.bin` | 17.1 MB | 15.9 MB | **92%** |
-| `model.json` | 168 KB | 7.4 KB | 4% |
-
-權重是 float32 高熵資料，gzip 只壓掉 8%。而且從 localhost 讀本來就只要 4ms，
-沒有東西可省。真要縮小體積該做的是**量化**（uint8 權重，體積變 1/4），
-但那要 `tensorflowjs_converter` 重轉、也會損失精度 —— 等要放上網路或給手機用再說。
+**完整的量測、補救嘗試、以及對照實驗在 [`METHOD.md`](METHOD.md) §5.2。**
+uint8 的選項與模型檔都已從專案移除；指令留著讓實驗可重現。
 
 ## Lightning 和 Thunder 差在哪
 
@@ -504,7 +476,7 @@ Safari 那條是查出來的已知問題（[WebKit bug 187896](https://bugs.webk
 - 直線擬合：垂直線 1.0000、原地抖動 0.4241、半圓 0.7666（門檻判斷正確）
 - 切半特效：連切三次無例外，canvas 變換矩陣正確復原（save/restore 平衡），
   非黑像素隨時間遞減（兩半掉出畫面、果汁淡出）
-- uint8 量化模型：建立 24ms、可推論、體積 2.50MB（原 4.82MB）
+- ~~uint8 量化模型~~：體積與速度都如預期，但真機偵測不到人，已移除
 - 本機模型：瀏覽器內實測 detector 建立 45ms vs CDN 5324ms，
   17 關節點、手腕手肘齊全、可推論
 - 推論／繪製解耦：rAF 的回呼只有 `renderLoop`，它不是 async 且函式體內無 await；
@@ -543,7 +515,7 @@ Safari 那條是查出來的已知問題（[WebKit bug 187896](https://bugs.webk
 - 拉直後的手感是否自然（門檻 0.975 在真實軌跡上的表現）
 - `F.slashMin = 0.12` 在真人揮手下會不會太嚴（面板的「最長筆畫」會告訴你）
 - 解耦後的實際數字：推論更新與畫面更新是否真的脫鉤
-- uint8 量化對真人影像的精度影響（按「比對 fp16 / uint8」）
+- ~~uint8 對真人影像的精度~~ 量完了：行不通，見 METHOD §5.2
 - 懸停圓圈用真的手去停會不會好停（3 秒是不是太久）
 - 音效在真實喇叭上的音量平衡
 

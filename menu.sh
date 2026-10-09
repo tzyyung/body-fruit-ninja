@@ -240,7 +240,16 @@ print(' '.join(p for g in d.get('weightsManifest',[]) for p in g['paths']))
 }
 
 # 把 fp16 權重再量化成 uint8，體積減半。
-# 注意：這會損失精度，用「比對 fp16 / uint8」按鈕量過再決定要不要用。
+#
+# **2026-10-09 量過：這條路行不通，產出的模型偵測不到人。**
+# 真機 29 幀裡 uint8 一次都沒抓到，同樣那 29 幀 fp16 只漏 1 次。
+# 原因不是腳本有 bug（恆等轉換的輸出跟原模型逐位元相同），
+# 是「整張量一組 scale」這種量化法對 MobileNetV2 就是不夠 ——
+# 正解是 per-channel，而 tfjs 的反量化只吃 per-tensor。
+# 詳見 docs/METHOD.md §5.2。
+#
+# 指令留著讓實驗可重現（例如之後 tfjs 支援 per-channel 了），
+# 但產出的模型預設不會被遊戲用到。
 do_quantize() {
   local src=models/movenet-lightning dst=models/movenet-lightning-uint8
   if [ ! -f "$src/model.json" ]; then
@@ -319,7 +328,7 @@ menu() {
     printf '  %st%s  跑單元測試\n'                   "$c_c" "$c_0"
     printf '  %sb%s  看瀏覽器 console（最新那個檔）\n' "$c_c" "$c_0"
   printf '  %s8%s  下載模型到本機（開頁不用再等 CDN）\n' "$c_c" "$c_0"
-  printf '  %s9%s  量化成 uint8（體積減半，會損失精度）\n'   "$c_c" "$c_0"
+  printf '  %s9%s  量化成 uint8（實驗用；量過行不通，見 METHOD §5.2）\n' "$c_c" "$c_0"
     printf '  %s6%s  看伺服器紀錄\n'                 "$c_c" "$c_0"
     printf '  %s7%s  看說明文件\n'                   "$c_c" "$c_0"
     printf '  %sq%s  離開（伺服器繼續跑）\n'         "$c_c" "$c_0"

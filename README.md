@@ -63,7 +63,7 @@ cd body-fruit-ninja
 
 ```sh
 ./menu.sh check         # 語法、重複 id、CDN 可用性、本機模型
-./menu.sh test          # 單元測試（14 檔 249 條）
+./menu.sh test          # 單元測試（14 檔 246 條）
 node tests/bdd.js       # 驗收條件（Gherkin，繁中關鍵字，36 個場景）
 ./menu.sh models        # 重新下載模型權重
 ```
