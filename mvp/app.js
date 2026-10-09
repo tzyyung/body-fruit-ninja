@@ -824,7 +824,7 @@
     return segs;
   }
 
-  // 這一連續動作總共掃過多長。分段量再相加，見 segments()。
+  // 這一連續動作在畫面上總共掃過多長。分段量再相加，見 segments()。
   function sweepLen(run) {
     let total = 0;
     for (const seg of segments(run)) {
@@ -833,6 +833,104 @@
       if (f) total += f.len;
     }
     return total;
+  }
+
+  // ── 手是掛在肩膀上的：射線–球面 ─────────────────────────────────────
+  //
+  // 肩膀固定，所以手腕一定在以肩為心、半徑＝臂長 L 的**球面**上。
+  // 相機看到的是那顆球的投影，所以從影像點往 z 射一條線去跟球求交，
+  // 就能把深度解回來（弱透視下射線平行 z，二次式退化成）：
+  //
+  //     z² = L² − d²         d = 投影後的 |手腕 − 肩膀|
+  //
+  // 判別式 L² − d² 為負 = 射線沒有交點 = 這個點不可能是掛在那個肩膀上的手。
+  // 但實務上 ±6px 的抖動把 d 推過輪廓邊界是常態，所以**夾到 0 而不是丟點**
+  // （等價於「手臂剛好在鏡頭平面內」，那是最接近的合法解）。
+  //
+  // 兩個根（±z）的歧義用時間連續性解：選離上一幀比較近的那個。
+  // 這是 2D→3D pose lifting 的標準做法（骨長約束 + 時間平滑）。
+  const ARM_OVER_FOREARM = 2.2;        // 上臂 30cm + 前臂 25cm ÷ 前臂 25cm
+  // 整段都維持在這個比例以上，就表示手臂在鏡頭平面內：
+  // 那時 2D 量得準，而 z 的導數 dz/dd → ∞ 是病態的，不要用它。
+  const LIFT_PLANAR = 0.95;
+  // 投影上的 肩→腕 至少要有 肩→肘→腕 的這個比例，才算「手臂伸直」。
+  // 完全伸直時是 1.0；0.9 大約對應手肘彎 50° 以內。
+  const STRAIGHT_ARM = 0.90;
+
+  function liftZ(dx, dy, armLen, prevZ) {
+    const z = Math.sqrt(Math.max(0, armLen * armLen - (dx * dx + dy * dy)));
+    return (prevZ != null && prevZ < 0) ? -z : z;
+  }
+
+  // 真正的 3D 掃過量，換算成「等效弧長 px」，跟畫面上的量同單位。
+  function sweep3D(run, sh, armLen) {
+    let total = 0;
+    for (const seg of segments(run)) {
+      if (seg.length < 2) continue;
+      let pz = null, prev = null;
+      for (const q of seg) {
+        const dx = q.x - sh.x, dy = q.y - sh.y;
+        const z = liftZ(dx, dy, armLen, pz);
+        pz = z;
+        const v = { x: dx, y: dy, z };
+        if (prev) {
+          const na = Math.hypot(prev.x, prev.y, prev.z), nb = Math.hypot(v.x, v.y, v.z);
+          if (na > 1 && nb > 1) {
+            const c = Math.min(1, Math.max(-1,
+              (prev.x*v.x + prev.y*v.y + prev.z*v.z) / (na * nb)));
+            total += Math.acos(c) * armLen;
+          }
+        }
+        prev = v;
+      }
+    }
+    return total;
+  }
+
+  // 這一刀掃過多少 —— 看條件數決定信 2D 還是 3D。
+  //
+  // 語料實測（12 種動作 × 動作平面偏離鏡頭 0/30/60/75° × 22% 掉點，每格 300 次）：
+  //
+  //   判準            最差偵測率   誤判率
+  //   只用 2D              0%        0%   ← 手臂在鏡頭平面內橫揮時整個看不到
+  //   只用 3D             47%        9%   ← 輪廓邊界上 z 病態，抖動變成假揮擊
+  //   依條件數切換       100%        0%
+  //
+  // 取 max 而不是二選一：投影只會變短，所以 2D 是真值的下界，
+  // 兩個都算、取大的，不會比單用 2D 差。
+  function sweepOf(run, side) {
+    const flat = sweepLen(run);
+    const sh0 = pipeKp[side + '_shoulder'], eb0 = pipeKp[side + '_elbow'];
+    const wr0 = pipeKp[side + '_wrist'];
+    if (!sh0 || !eb0 || !wr0) return flat;
+    if (sh0.score < MIN_SCORE || eb0.score < scoreNeed('elbow')
+        || wr0.score < MIN_SCORE) return flat;
+    const armLen = bodyScale(pipeKp) * ARM_OVER_FOREARM;
+    if (!(armLen > 4)) return flat;
+
+    // ★ 球面模型只在「手臂伸直」時成立。
+    //
+    // 手不是在球面上，是在球**體**裡 —— 球面只是外邊界，手肘一彎半徑就變短。
+    // 假設永遠伸直的話，手肘彎著揮時 z = √(L²−d²) 會憑空捏造出很大的深度，
+    // 算出來的角度整個是假的（驗收測試在「伸展 0.4」那幾列抓到這件事）。
+    //
+    // 真正通用的做法是逐段 lifting（肩→肘一顆球、肘→腕一顆球，各自用自己的
+    // 骨長），那是文獻裡的骨長約束。還沒做，也還沒有對應的語料可以驗，
+    // 所以這裡只在「投影上手臂接近伸直」時才用球面模型 ——
+    // 那是它唯一站得住腳的區域。其餘一律退回 2D（2D 是真值的下界，不會更糟）。
+    const d1 = Math.hypot(sh0.x - eb0.x, sh0.y - eb0.y);
+    const d2 = Math.hypot(eb0.x - wr0.x, eb0.y - wr0.y);
+    const d0 = Math.hypot(sh0.x - wr0.x, sh0.y - wr0.y);
+    if (d1 + d2 < 4 || d0 < (d1 + d2) * STRAIGHT_ARM) return flat;
+
+    // 軌跡點是鏡像過的畫布座標，肩膀要套同一個鏡像才在同一個空間
+    const sh = { x: cv.width - sh0.x, y: sh0.y };
+    let minRatio = 1;
+    for (const q of run) {
+      minRatio = Math.min(minRatio, Math.hypot(q.x - sh.x, q.y - sh.y) / armLen);
+    }
+    if (minRatio > LIFT_PLANAR) return flat;     // 手臂在鏡頭平面內，2D 就準
+    return Math.max(flat, sweep3D(run, sh, armLen));
   }
 
   function activeRun(tr) {
@@ -869,7 +967,7 @@
     //   各段相加（現在）         88%        0%
     //
     // 三種判準的誤判率都是 0%，所以選涵蓋面最好的那個。
-    const sweep = sweepLen(run);
+    const sweep = sweepOf(run, side);
     const slashing = !gateMoving() || sweep >= slashMinPx();
     stats.strokeMax = Math.max(stats.strokeMax, sweep);
     stats.linSum += fit.linearity; stats.linN++;

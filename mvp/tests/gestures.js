@@ -101,4 +101,48 @@ const NEG_CASES = [
   { shape: '微調', size: 1.0,  ms: 500 },
 ];
 
-module.exports = { SHAPES, NEGATIVE, trajectory, CASES, NEG_CASES, seed };
+module.exports.random = random;
+module.exports = Object.assign(module.exports, { SHAPES, NEGATIVE, trajectory, CASES, NEG_CASES, seed });
+
+// ── 解剖約束：手是掛在肩膀上的 ───────────────────────────────────────────
+//
+// 肩膀固定，所以手腕的位置被限制在以肩為心、半徑約臂長的環帶裡，
+// 揮動就是在那條弧上走。這讓動作可以預測：
+//   1) 距離上限 —— 超出可及範圍的偵測值一定是錯的（比速度上限強，而且不用校正）
+//   2) 揮擊量用「繞肩膀掃過的角度」—— 跟手伸多長無關，天生是身體尺度
+//   3) 掉幀可以沿弧外推補點，不是只能容忍
+//
+// 上臂約 30cm、前臂約 25cm，所以肩→腕的距離在 [約 0.35, 1.0] × 55cm 之間
+// （手肘完全彎曲時最短，伸直時最長）。
+const UPPER_OVER_FOREARM = 30 / 25;
+
+// 把一條自由平面上的軌跡，壓回「肩膀構造允許」的範圍。
+// 方向保留，只夾半徑 —— 真實的手做不到的位置，語料裡也不該出現。
+function anchorToShoulder(pts, shoulder, forearm) {
+  const armLen = forearm * (1 + UPPER_OVER_FOREARM);   // 肩→腕伸直時
+  const rMin = armLen * 0.35, rMax = armLen;
+  return pts.map((p) => {
+    const dx = p.x - shoulder.x, dy = p.y - shoulder.y;
+    const r = Math.hypot(dx, dy) || 1;
+    const k = Math.min(rMax, Math.max(rMin, r)) / r;
+    return { x: shoulder.x + dx * k, y: shoulder.y + dy * k, t: p.t };
+  });
+}
+
+// 繞肩膀掃過的角度總和（弧度）。分段相加，跟 sweepLen 同一個道理。
+function angularSweep(pts, shoulder) {
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const a0 = Math.atan2(pts[i-1].y - shoulder.y, pts[i-1].x - shoulder.x);
+    const a1 = Math.atan2(pts[i].y   - shoulder.y, pts[i].x   - shoulder.x);
+    let d = a1 - a0;
+    while (d >  Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    total += Math.abs(d);
+  }
+  return total;
+}
+
+module.exports.UPPER_OVER_FOREARM = UPPER_OVER_FOREARM;
+module.exports.anchorToShoulder = anchorToShoulder;
+module.exports.angularSweep = angularSweep;

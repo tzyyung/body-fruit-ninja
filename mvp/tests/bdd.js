@@ -60,6 +60,11 @@ function parse(text) {
       examples.push(line.split('|').slice(1, -1).map((c) => c.trim()));
       continue;
     }
+    // 只有在背景或場景裡面才收步驟。
+    // 「功能」底下的說明是自由文字，裡面很容易出現以關鍵字開頭的句子
+    // （「同時報偵測率與誤報率」開頭是「同時」＝And，「當單一指標」開頭是「當」），
+    // 不擋的話會被當成沒有場景的步驟而炸掉。
+    if (mode !== 'background' && mode !== 'scenario') continue;
     const st = stepKw(line);
     if (!st) continue;
     (mode === 'background' ? feature.background : cur.steps).push(st);
