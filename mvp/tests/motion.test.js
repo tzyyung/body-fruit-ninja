@@ -43,6 +43,8 @@ function detect(pts, forearm) {
 
 const N = 400;
 function rate(c, forearm, fps, dropout, jitter) {
+  // 每一格都從同一個種子開始，所以整張表是可重現的
+  G.seed(0xC0FFEE);
   let hits = 0;
   for (let i = 0; i < N; i++) {
     const pts = G.trajectory({ ...c, forearm, fps, dropout, jitter });

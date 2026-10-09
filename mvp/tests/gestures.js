@@ -41,7 +41,19 @@ const NEGATIVE = {
   微調:       (u) => [Math.sin(u * Math.PI * 2) * 0.05, 0],
 };
 
-const rnd = (a) => (Math.random() * 2 - 1) * a;
+// 固定種子的亂數。會飄的測試比沒有測試更糟 ——
+// 同一份程式跑兩次結果不一樣，就沒辦法用它判斷「我剛才改壞了沒」。
+// mulberry32，夠均勻而且三行寫得完。
+let _seed = 0x9E3779B9;
+function seed(n) { _seed = n >>> 0; }
+function random() {
+  _seed = (_seed + 0x6D2B79F5) >>> 0;
+  let t = _seed;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const rnd = (a) => (random() * 2 - 1) * a;
 
 // 產生一段軌跡。
 //   shape    形狀名
@@ -58,7 +70,7 @@ function trajectory({ shape, size, forearm, fps, ms, jitter = 6, dropout = 0 }) 
   const pts = [];
   for (let i = 0; i < n; i++) {
     const now = i * (1000 / fps);
-    if (dropout > 0 && i > 0 && i < n - 1 && Math.random() < dropout) continue;
+    if (dropout > 0 && i > 0 && i < n - 1 && random() < dropout) continue;
     const [ux, uy] = f(i / (n - 1));
     pts.push({ x: 320 + ux * size * forearm + rnd(jitter),
                y: 240 + uy * size * forearm + rnd(jitter),
@@ -89,4 +101,4 @@ const NEG_CASES = [
   { shape: '微調', size: 1.0,  ms: 500 },
 ];
 
-module.exports = { SHAPES, NEGATIVE, trajectory, CASES, NEG_CASES };
+module.exports = { SHAPES, NEGATIVE, trajectory, CASES, NEG_CASES, seed };
