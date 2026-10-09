@@ -1,0 +1,92 @@
+// 動作語料：把常見的手勢軌跡產生出來，用來量偵測率。
+//
+// 為什麼要這個：靠使用者玩一局、回報一種失效、修一種 —— 那是把人當測試機，
+// 而且每次只覆蓋他剛好做過的那個動作。常見動作就那幾種，直接全部產生出來
+// 一次跑完，用數據訂規則。
+//
+// 座標單位是像素，尺寸以「前臂長」為單位給（身體尺度，見 CLAUDE.md §4.3），
+// 所以同一組語料可以在不同站位（前臂 76 / 151 / 210 px）下重跑。
+//
+// 不做機器學習：這是幾何判準，不是分類問題。樣本要的是「涵蓋面」，
+// 訓練資料要的是「代表性分布」—— 前者產生得出來，後者產生不出來。
+
+// ── 形狀：給 u ∈ [0,1]，回傳單位尺度下的座標 ──
+const SHAPES = {
+  直線上揮:   (u) => [0, -u],
+  直線下砍:   (u) => [0, u],
+  橫線:       (u) => [u, 0],
+  斜線:       (u) => [u * 0.707, -u * 0.707],
+  反斜線:     (u) => [-u * 0.707, -u * 0.707],
+  '1/4圓':    (u) => [Math.cos(u * Math.PI / 2), Math.sin(u * Math.PI / 2) - 1],
+  半圓:       (u) => [Math.cos(u * Math.PI), Math.sin(u * Math.PI)],
+  整圈:       (u) => [Math.cos(u * 2 * Math.PI), Math.sin(u * 2 * Math.PI)],
+  方形:       (u) => { const s = u * 4;
+                       if (s < 1) return [s, 0];
+                       if (s < 2) return [1, s - 1];
+                       if (s < 3) return [3 - s, 1];
+                       return [0, 4 - s]; },
+  三角形:     (u) => { const s = u * 3;
+                       if (s < 1) return [s, 0];
+                       if (s < 2) return [1 - (s - 1) * 0.5, (s - 1) * 0.866];
+                       return [0.5 - (s - 2) * 0.5, 0.866 - (s - 2) * 0.866]; },
+  之字:       (u) => { const s = u * 3, k = Math.floor(s), f = s - k;
+                       return [s / 3, (k % 2 ? 1 - f : f) * 0.5]; },
+  戳刺:       (u) => [0, -u],          // 跟直線同形，靠 size 很小來區分
+};
+
+// 不該被判成一刀的對照組
+const NEGATIVE = {
+  靜止:       (u) => [0, 0],
+  慢移:       (u) => [u, 0],
+  微調:       (u) => [Math.sin(u * Math.PI * 2) * 0.05, 0],
+};
+
+const rnd = (a) => (Math.random() * 2 - 1) * a;
+
+// 產生一段軌跡。
+//   shape    形狀名
+//   size     尺寸，單位是前臂長
+//   forearm  前臂在畫面上幾 px
+//   fps      推論更新率
+//   ms       這個動作花多久
+//   jitter   每點的追蹤抖動（px）
+//   dropout  每幀掉點機率（刀刃抓不到）
+function trajectory({ shape, size, forearm, fps, ms, jitter = 6, dropout = 0 }) {
+  const f = SHAPES[shape] || NEGATIVE[shape];
+  if (!f) throw new Error('沒有這個形狀：' + shape);
+  const n = Math.max(2, Math.round(ms / 1000 * fps));
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const now = i * (1000 / fps);
+    if (dropout > 0 && i > 0 && i < n - 1 && Math.random() < dropout) continue;
+    const [ux, uy] = f(i / (n - 1));
+    pts.push({ x: 320 + ux * size * forearm + rnd(jitter),
+               y: 240 + uy * size * forearm + rnd(jitter),
+               t: now });
+  }
+  return pts;
+}
+
+// 常見動作的預設參數（尺寸單位＝前臂長，時間取自 README「一刀 150–250ms」）
+const CASES = [
+  { shape: '直線上揮', size: 1.6, ms: 200 },
+  { shape: '直線下砍', size: 1.8, ms: 180 },
+  { shape: '橫線',     size: 2.0, ms: 200 },
+  { shape: '斜線',     size: 1.8, ms: 200 },
+  { shape: '反斜線',   size: 1.8, ms: 200 },
+  { shape: '1/4圓',    size: 1.2, ms: 220 },
+  { shape: '半圓',     size: 1.0, ms: 260 },
+  { shape: '整圈',     size: 0.8, ms: 320 },
+  { shape: '方形',     size: 1.0, ms: 400 },
+  { shape: '三角形',   size: 1.0, ms: 340 },
+  { shape: '之字',     size: 1.6, ms: 300 },
+  { shape: '戳刺',     size: 0.5, ms: 120 },
+];
+
+const NEG_CASES = [
+  { shape: '靜止', size: 0,    ms: 400 },
+  { shape: '慢移', size: 0.25, ms: 600 },   // 約 0.4 前臂/秒
+  { shape: '微調', size: 1.0,  ms: 500 },
+];
+
+module.exports = { SHAPES, NEGATIVE, trajectory, CASES, NEG_CASES };

@@ -774,6 +774,67 @@
   }
 
   // 軌跡尾端連續相連的那一段 —— 掉點造成的斷裂不要跨過去一起擬合
+  // 這一點接不接得上上一點。
+  //
+  // 「接得上」才算同一筆；接不上就從這裡開始新的一筆（activeRun 用它切）。
+  // 兩道各自獨立：隔太久（掉點太多）或跳太遠（追蹤跳動）都不接。
+  function linkInfo(p, b, now) {
+    const dtp = Math.max((now - p.t) / 1000, 1e-3);
+    const dist = Math.hypot(b.tx - p.tx, b.ty - p.ty);
+    const speed = dist / dtp;
+    const inTime = (now - p.t) <= MAX_LINK_MS;
+    // 「跳太遠」就是「速度超過人手可能的極限」，那個量已經有了（maxSpeedPx），
+    // 不要再另外訂一個距離門檻。
+    //
+    // 原本是 dist <= px(F.maxLink) = 畫面寬的 35%（640 下 224px）——
+    // 一個絕對的畫面比例，違反 §4.3，而且不隨影格間隔變。
+    // 後果：15fps 下一刀只有 3 個點，掉一點就變成單步 242px > 224px
+    // → 判定接不上 → 整段筆畫斷掉。語料實測 15fps + 22% 掉點時
+    // 直線揮的偵測率只有 78–81%，8fps 幾乎全掛。
+    // 改成速度上限之後兩者都回到 ~100%（見 tests/motion.test.js 的表）。
+    const inRange = dist <= maxSpeedPx() * dtp;
+    return { dist, speed, inTime, inRange,
+             linked: inTime && inRange,
+             fast: speed > px(F.fastSpeed),
+             moving: speed >= px(F.moveSpeed) };
+  }
+
+  // 把一筆軌跡在「方向反轉」的地方切段。
+  //
+  // 揮出去和拉回來是兩段，但那是同一個動作 —— 人的手揮到底一定要收回來，
+  // 收回的那一段也是這次揮擊的一部分，不該讓它重新從零賺一次門檻。
+  // 所以切段不是為了拆散它們，是為了「分段量、再相加」：
+  // 整段直線擬合會讓來回互相抵消（去 160px、回 160px，投影長還是 160px），
+  // 分段相加才量得到真正掃過的 320px。
+  //
+  // 反轉的判準是相鄰兩步的內積為負（夾角超過 90°）。
+  function segments(run) {
+    if (run.length < 2) return [run];
+    const segs = [];
+    let cur = [run[0]];
+    for (let i = 1; i < run.length; i++) {
+      if (i >= 2) {
+        const ax = run[i-1].x - run[i-2].x, ay = run[i-1].y - run[i-2].y;
+        const bx = run[i].x   - run[i-1].x, by = run[i].y   - run[i-1].y;
+        if (ax * bx + ay * by < 0) { segs.push(cur); cur = [run[i-1]]; }
+      }
+      cur.push(run[i]);
+    }
+    segs.push(cur);
+    return segs;
+  }
+
+  // 這一連續動作總共掃過多長。分段量再相加，見 segments()。
+  function sweepLen(run) {
+    let total = 0;
+    for (const seg of segments(run)) {
+      if (seg.length < 2) continue;
+      const f = fitLine(seg);
+      if (f) total += f.len;
+    }
+    return total;
+  }
+
   function activeRun(tr) {
     if (tr.length < 2) return tr.slice();
     let i = tr.length - 1;
@@ -797,8 +858,20 @@
                   && fit.linearity >= MIN_LINEARITY
                   && fit.len >= px(MIN_STROKE);
     // 沒揮出一刀就不是刀。靜止的手不該因為水果飛過來就切到它。
-    const slashing = !gateMoving() || fit.len >= slashMinPx();
-    stats.strokeMax = Math.max(stats.strokeMax, fit.len);
+    //
+    // 量的是「這個連續動作掃過多長」（分段相加），不是整段的直線擬合長。
+    // 整段擬合會讓來回互相抵消，也量不到轉折 —— 動作語料實測
+    // （tests/motion.test.js，每格 400 次）：
+    //
+    //   判準                  最差偵測率   誤判率
+    //   整段 fit.len（舊）        0%        0%   ← 三角形 15fps 全漏
+    //   各段取最大                0%        0%   ← 之字 30fps 掉到 63%
+    //   各段相加（現在）         88%        0%
+    //
+    // 三種判準的誤判率都是 0%，所以選涵蓋面最好的那個。
+    const sweep = sweepLen(run);
+    const slashing = !gateMoving() || sweep >= slashMinPx();
+    stats.strokeMax = Math.max(stats.strokeMax, sweep);
     stats.linSum += fit.linearity; stats.linN++;
     return { run, fit, straight, slashing };
   }
@@ -2049,31 +2122,35 @@
         stats.bladeLen = Math.max(stats.bladeLen, Math.hypot(b.tx - b.bx, b.ty - b.by));
         let linked = false, fast = false, moving = false;
         if (p) {
-          const dtp = Math.max((now - p.t) / 1000, 1e-3);
-          const dist = Math.hypot(b.tx - p.tx, b.ty - p.ty);
-          const speed = dist / dtp;
-          stats.maxSpeed = Math.max(stats.maxSpeed, speed);
-          stats.maxGap = Math.max(stats.maxGap, dist);
-          fast = speed > px(F.fastSpeed);
+          const L = linkInfo(p, b, now);
+          fast = L.fast; moving = L.moving; linked = L.linked;
+          stats.maxSpeed = Math.max(stats.maxSpeed, L.speed);
+          stats.maxGap = Math.max(stats.maxGap, L.dist);
           if (fast) stats.fastSamples++;
-          moving = speed >= px(F.moveSpeed);
-          const inTime = (now - p.t) <= MAX_LINK_MS;
-          const inRange = dist <= px(F.maxLink);
-          linked = inTime && inRange;
           // 分別記下是哪一道關卡擋掉的，才不用再猜
           stats.linkTries++;
-          if (!inTime) stats.rejTime++;
-          if (!inRange) stats.rejRange++;
+          if (!L.inTime) stats.rejTime++;
+          if (!L.inRange) stats.rejRange++;
           if (linked) stats.linkOk++;
-          stats.gapSum += dist; stats.gapN++;
+          stats.gapSum += L.dist; stats.gapN++;
         }
         trails[side].push({ x:b.tx, y:b.ty, t:now, linked, moving, pad: b.pad || 0 });
         bases[side].push({ x:b.bx, y:b.by, t:now, linked, moving });
         prev[side] = { tx:b.tx, ty:b.ty, t:now, fast };
       } else {
-        // 上一幀正在快揮、這一幀抓不到 → 動態模糊掉點的特徵
+        // 這一幀沒抓到刀，但**不要把 prev 清掉**。
+        //
+        // 清掉的話下一個點的 linked 必然是 false，activeRun 就從那裡切開、
+        // 整段筆畫重新開始 —— 而 MAX_LINK_MS（260ms）與 maxLink（224px）
+        // 這兩個「容忍掉點」的常數就形同虛設，它們存在的理由正是這個。
+        //
+        // 實機刀刃抓到率約 78%，每五幀掉一幀 → 平均每段只剩 4–5 點
+        // （約 150ms），遠短於 280ms 的視窗，fit.len 被腰斬、揮了也不算一刀。
+        // 畫圓時手臂朝向變化大、掉點更密集，所以那個姿勢最明顯
+        // （使用者回報「手畫圓型時會漏揮動」）。
+        //
+        // 真的斷太久或跳太遠，inTime / inRange 會各自擋下來。
         if (p && p.fast) stats.fastDropouts++;
-        prev[side] = null;
       }
     }
     pipeKp = kp;                     // 管線實際用的那一份
