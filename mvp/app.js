@@ -45,7 +45,25 @@
     // 「看到什麼就是什麼」，而且畫面上會把這個邊界畫出來（見 drawFruits）。
     bombR:     0.0333,
   };
-  const px = (frac) => frac * cv.width;
+  // ── 三種尺度，用途不同，絕對不要混用 ──────────────────────────────
+  //
+  //   px(r)   水平距離、物件大小      r × 畫布寬
+  //   py(r)   垂直距離、速度、重力    r × 畫布高
+  //   fs(n)   字級、線寬              n × (畫布寬 ÷ 640)
+  //
+  // 原本只有 px 一個，垂直方向的東西也拿它量 —— 在 4:3 下剛好對得上，
+  // 換成 16:9 就錯了。getUserMedia 只給 ideal:640x480，16:9 的相機
+  // （含 Continuity Camera）會回 640×360，於是：
+  //   水果初速 px(1.19) = 畫面寬的 1.19 倍，但畫面只有 0.5625 倍寬那麼高
+  //   → 飛出上緣最久 1.08 秒，56% 的水果會消失一陣子再掉回來。
+  //
+  // 字級則是另一個方向的錯：31 處寫死 px，1280 的相機下畫布放大兩倍、
+  // 字還是同樣大小，等比縮到版面上就只剩一半。
+  //
+  // 常數全部用 640×480 當基準換算過，所以 4:3 下行為完全不變。
+  const px = (r) => r * cv.width;
+  const py = (r) => r * cv.height;
+  const fs = (n) => n * (cv.width / 640);
 
   let MIN_SCORE   = 0.3;   // 由面板調整
   // 原本 150/120ms 是假設跑在 30fps 以上。推論掉到 8fps 時幀間隔就 >120ms，
@@ -55,7 +73,8 @@
   // 掃過長度到門檻的這個比例就提示「揮大一點」。
   // 0.5 以下多半不是在揮刀（調整姿勢、把手移到按鈕上），提示了只是噪音。
   const NEAR_SLASH = 0.5;
-  const GRAVITY_F   = 1.53;  // 每秒每秒幾個畫面寬（tubakhxn 的 1850@720p 換算）
+  // 每秒每秒幾個畫面**高**（原本 1.53 個畫面寬 @640×480 = 2.04 個畫面高）
+  const GRAVITY_F   = 2.04;
 
   // 原版《水果忍者》砍到炸彈是直接結束，但體感操作的追蹤本來就會抖，
   // 誤砍的機率比觸控高得多，一刀斃命會讓人覺得是程式在找碴。
@@ -168,6 +187,7 @@
     combo:el('m-combo'), crit:el('m-crit'), lr:el('m-lr'),
     jump:el('m-jump'), bone:el('m-bone'), side:el('m-side'), arm:el('m-arm'),
     chain:el('m-chain'), chain2:el('m-chain2'), state:el('m-state'),
+    panelBtn:el('btn-panel'),
     track:el('m-track'),
     link:el('m-link'), rejMove:el('m-rej-move'), rejTime:el('m-rej-time'),
     rejRange:el('m-rej-range'), gapAvg:el('m-gapavg'), lin:el('m-lin'),
@@ -325,6 +345,9 @@
       await new Promise((r) => video.addEventListener('loadedmetadata', r, { once:true }));
     }
     cv.width = video.videoWidth; cv.height = video.videoHeight;
+    // 版面要知道長寬比才能同時約束寬與高（見 index.html 的 .stage）。
+    // 相機可能給 4:3 也可能給 16:9，不能寫死。
+    cv.parentElement.style.setProperty('--ar', (cv.width / cv.height).toFixed(4));
   }
 
   function cameraLost(why) {
@@ -1185,6 +1208,43 @@
 
   const autoScore = () => ui.scoreSel.value === 'auto';
 
+  // ── 量測面板的收合 ────────────────────────────────────────────────
+  //
+  // 面板是給開發者看的儀器，玩的時候只會佔畫面。窄螢幕（手機、平板直式）
+  // 預設收起來 —— 不收的話 640 的 canvas 會被擠成一條。
+  // 寬螢幕預設展開，按了才收。
+  //
+  // 兩個 class 而不是一個：窄螢幕用 panel-open（預設關），
+  // 寬螢幕用 panel-closed（預設開）。同一顆鈕，兩邊的預設相反。
+  const PANEL_KEY = 'watermelon.panel';
+  const narrow = () => window.matchMedia('(max-width: 900px)').matches;
+
+  function panelShown() {
+    return narrow() ? document.body.classList.contains('panel-open')
+                    : !document.body.classList.contains('panel-closed');
+  }
+
+  function setPanel(show) {
+    document.body.classList.toggle('panel-open', !!show);
+    document.body.classList.toggle('panel-closed', !show);
+    ui.panelBtn.setAttribute('aria-expanded', show ? 'true' : 'false');
+    ui.panelBtn.textContent = show ? '收起量測' : '量測';
+    try { localStorage.setItem(PANEL_KEY, show ? '1' : '0'); } catch (e) { /* 無痕視窗會丟錯 */ }
+  }
+
+  (function initPanel() {
+    let saved = null;
+    try { saved = localStorage.getItem(PANEL_KEY); } catch (e) { /* 同上 */ }
+    setPanel(saved === null ? !narrow() : saved === '1');
+    ui.panelBtn.addEventListener('click', () => setPanel(!panelShown()));
+    // 轉向或縮放視窗時，沒有自己設定過就跟著斷點走
+    window.matchMedia('(max-width: 900px)').addEventListener('change', () => {
+      let s2 = null;
+      try { s2 = localStorage.getItem(PANEL_KEY); } catch (e) { /* 同上 */ }
+      if (s2 === null) setPanel(!narrow());
+    });
+  })();
+
   function resetCalib() {
     for (const k of Object.keys(trk)) trk[k].reset();
     calib = null; calLast = null;
@@ -1574,7 +1634,7 @@
     if (!pts.length) {
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillStyle = '#fbbf24';
-      ctx.font = '600 16px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '600 ' + fs(16) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.fillText(framingHint(), cv.width / 2, cv.height * 0.84);
       drawWhyNoArm(cv.height * 0.90);
       return;
@@ -1584,10 +1644,10 @@
       const pulse = 1 + 0.12 * Math.sin(performance.now() / 260);
       ctx.save();
       ctx.translate(p.x, p.y);
-      ctx.beginPath(); ctx.arc(0, 0, 26 * pulse, 0, 6.3);
+      ctx.beginPath(); ctx.arc(0, 0, fs(26) * pulse, 0, 6.3);
       ctx.fillStyle = 'rgba(96,165,250,.22)'; ctx.fill();
-      ctx.lineWidth = 2.5; ctx.strokeStyle = 'rgba(96,165,250,.95)'; ctx.stroke();
-      ctx.font = '26px serif';
+      ctx.lineWidth = fs(2.5); ctx.strokeStyle = 'rgba(96,165,250,.95)'; ctx.stroke();
+      ctx.font = '' + fs(26) + 'px serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText('🖐', 0, 1);
       ctx.restore();
@@ -1608,7 +1668,7 @@
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, cv.width, cv.height);
       ctx.fillStyle = 'rgba(248,113,113,' + Math.min(1, hurt * 1.6).toFixed(2) + ')';
-      ctx.font = '700 26px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '700 ' + fs(26) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(hurtWhy, cv.width / 2, cv.height * 0.20);
     }
@@ -1618,14 +1678,14 @@
 
     ctx.textAlign = 'left'; ctx.textBaseline = 'top';
     ctx.fillStyle = '#9aa3b2';
-    ctx.font = '600 13px -apple-system,"PingFang TC",sans-serif';
+    ctx.font = '600 ' + fs(13) + 'px -apple-system,"PingFang TC",sans-serif';
     ctx.fillText('分數', 16, 12);
     ctx.fillStyle = now < doubleUntil ? '#fbbf24' : '#fff';
-    ctx.font = '700 40px -apple-system,"PingFang TC",sans-serif';
+    ctx.font = '700 ' + fs(40) + 'px -apple-system,"PingFang TC",sans-serif';
     ctx.fillText(String(score), 16, 28);
 
     ctx.textAlign = 'right';
-    ctx.font = '24px serif';
+    ctx.font = '' + fs(24) + 'px serif';
     let hearts = '';
     for (let i = 0; i < LIVES; i++) hearts += i < lives ? '❤️' : '🖤';
     // 剛扣命時愛心抖一下，視線在別處也會被餘光抓到
@@ -1637,7 +1697,7 @@
     const badge = (icon, label, until) => {
       const left = (until - now) / 1000;
       if (left <= 0) return;
-      ctx.font = '600 14px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '600 ' + fs(14) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.fillStyle = '#fbbf24';
       ctx.fillText(icon + ' ' + label + ' ' + left.toFixed(1) + 's', cv.width - 14, y);
       y += 22;
@@ -1651,9 +1711,9 @@
       ctx.textAlign = 'center';
       ctx.globalAlpha = Math.min(1, fade * 1.6);
       ctx.fillStyle = '#67e8f9';
-      ctx.font = '700 34px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '700 ' + fs(34) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.fillText(comboN + ' 連擊！', cv.width / 2, cv.height * 0.14);
-      ctx.font = '600 15px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '600 ' + fs(15) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.fillText('×' + Math.min(comboN, COMBO_MAX), cv.width / 2, cv.height * 0.14 + 26);
       ctx.globalAlpha = 1;
     }
@@ -1681,7 +1741,7 @@
   function drawWhyNoArm(y) {
     if (!lastPose) {
       ctx.fillStyle = '#9aa3b2';
-      ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '400 ' + fs(12) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.fillText('完全沒偵測到人', cv.width / 2, y);
       return;
     }
@@ -1720,7 +1780,7 @@
 
     for (const r of rows) {
       if (r.kind === 'scores') {
-        ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+        ctx.font = '400 ' + fs(12) + 'px -apple-system,"PingFang TC",sans-serif';
         ctx.textAlign = 'left';
         let x = cv.width / 2 - 150;
         for (const side of SIDES) {
@@ -1740,17 +1800,17 @@
         }
         ctx.textAlign = 'center';
       } else if (r.kind === 'hint') {
-        ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+        ctx.font = '400 ' + fs(12) + 'px -apple-system,"PingFang TC",sans-serif';
         ctx.fillStyle = why.length ? '#fbbf24' : '#9aa3b2';
         ctx.fillText(r.text, cv.width / 2, cy);
       } else {
-        ctx.font = '400 11px ui-monospace,Menlo,monospace';
+        ctx.font = '400 ' + fs(11) + 'px ui-monospace,Menlo,monospace';
         ctx.fillStyle = '#9aa3b2';
         ctx.fillText(r.text, cv.width / 2, cy);
       }
       cy += r.h;
     }
-    ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+    ctx.font = '400 ' + fs(12) + 'px -apple-system,"PingFang TC",sans-serif';
   }
 
   // 把模型輸出的 17 個點原封不動畫出來 —— 不過門檻、不經穩定化。
@@ -1769,7 +1829,7 @@
   function drawRawPose() {
     if (!lastPose) {
       ctx.fillStyle = '#f87171';
-      ctx.font = '600 15px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '600 ' + fs(15) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('模型完全沒回傳姿勢', cv.width / 2, cv.height * 0.5);
       return;
@@ -1777,7 +1837,7 @@
     const kp = rawKp;
     const X = (k) => cv.width - k.x;   // 畫面是鏡像的
 
-    ctx.lineWidth = 2;
+    ctx.lineWidth = fs(2);
     for (const [a, b] of SKELETON) {
       const ka = kp[a], kb = kp[b];
       if (!ka || !kb) continue;
@@ -1786,7 +1846,7 @@
       ctx.beginPath(); ctx.moveTo(X(ka), ka.y); ctx.lineTo(X(kb), kb.y); ctx.stroke();
     }
     ctx.textAlign = 'left';
-    ctx.font = '600 10px ui-monospace,Menlo,monospace';
+    ctx.font = '600 ' + fs(10) + 'px ui-monospace,Menlo,monospace';
     for (const k of Object.values(rawKp)) {
       if (!k.name) continue;
       const x = X(k), y = k.y;
@@ -1798,7 +1858,7 @@
     }
     ctx.textAlign = 'center';
     ctx.fillStyle = '#fbbf24';
-    ctx.font = '600 13px -apple-system,"PingFang TC",sans-serif';
+    ctx.font = '600 ' + fs(13) + 'px -apple-system,"PingFang TC",sans-serif';
     ctx.fillText('原始輸出（未過門檻）　整體分數 '
       + (lastPose.score != null ? lastPose.score.toFixed(2) : '—'),
       cv.width / 2, 18);
@@ -1821,10 +1881,10 @@
         ctx.stroke();
       }
       ctx.fillStyle = '#e6e8ec';
-      ctx.font = '600 17px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '600 ' + fs(17) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(b.label, 0, -7);
-      ctx.font = '400 11px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '400 ' + fs(11) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.fillStyle = '#9aa3b2';
       ctx.fillText('手停住，或用點的', 0, 13);
       ctx.restore();
@@ -2099,7 +2159,7 @@
   // 浮動的文字（切中的分數、漏掉、炸彈扣分…）。
   // 三個地方各自組一份物件，欄位遲早會漂 —— 統一從這裡出。
   function popText(x, y, text, color) {
-    pops.push({ x, y: Math.min(y, cv.height - px(0.06)),
+    pops.push({ x, y: Math.min(y, cv.height - py(0.08)),
                 text, color, t: performance.now() });
   }
 
@@ -2174,7 +2234,8 @@
     fruits.push({
       x, y: cv.height + px(F.fruitR),
       vx: ((cv.width / 2 - x) * 0.45 + (Math.random() - 0.5) * 120) * slow,
-      vy: -(px(1.19) + Math.random() * px(0.41)) * slow,
+      // 1.587 / 0.547 個畫面高 = 原本的 1.19 / 0.41 個畫面寬 @640×480
+      vy: -(py(1.587) + Math.random() * py(0.547)) * slow,
       ch: kind.ch, color: kind.color,
       bomb: !!bomb, treasure: treasure || null,
       dead: false, rot: 0, spin: (Math.random() - 0.5) * 4 * slow,
@@ -2187,7 +2248,7 @@
   // 沒人的時候水果凍住，但果汁、閃光這些殘留特效要讓它們播完，
   // 不然畫面會卡著一堆半透明的東西
   function stepEffectsOnly(dt) {
-    const g = px(GRAVITY_F);
+    const g = py(GRAVITY_F);
     bits = bits.filter((b) => {
       b.vy += g * dt; b.x += b.vx * dt; b.y += b.vy * dt;
       return b.y < cv.height + 20 && now - b.t < 900;
@@ -2200,7 +2261,7 @@
     const now = performance.now();
     // 慢動作只放慢水果，手的追蹤與刀痕維持原速 —— 不然會變成整個遊戲變鈍
     if (now < freezeUntil) dt *= 0.42;
-    const g = px(GRAVITY_F);
+    const g = py(GRAVITY_F);
     const kept = [];
     for (const f of fruits) {
       if (f.dead) continue;   // 被切開的那塊由它的兩個子塊接手
@@ -2311,7 +2372,7 @@
         x: f.x + nx * side * R * 0.12,
         y: f.y + ny * side * R * 0.12,
         vx: f.vx + nx * side * sep,
-        vy: Math.min(f.vy, -px(0.18)) + ny * side * sep,
+        vy: Math.min(f.vy, -py(0.24)) + ny * side * sep,
         rot: f.rot, spin: f.spin + side * (1.5 + Math.random() * 2),
         // 剛生出來的碎塊先無敵一下，否則同一刀的同一條線段會立刻把它再切一次
         born: now,
@@ -2377,7 +2438,7 @@
   // 把一次推論結果吃進軌跡裡
   function showStartBtn() {
     hoverBtns = [{ x: cv.width / 2, y: cv.height * 0.58,
-                   r: Math.min(78, cv.width * 0.12),
+                   r: px(0.12),
                    label: '開始', dwell: 0, action: beginPlay }];
   }
 
@@ -2658,7 +2719,7 @@
       // 原本是先用 filter 把低分的點濾掉、再把剩下的依序連起來 ——
       // 手肘沒過門檻時那會畫出一條「肩膀→手腕」的直線，
       // 看起來像三點一線成立了，實際上根本不是解剖學上的鏈。
-      ctx.lineWidth = 3;
+      ctx.lineWidth = fs(3);
       const sw = shoulderWidth(kp);
       for (const side of SIDES) {
         const sh = kp[side + '_shoulder'], eb = kp[side + '_elbow'],
@@ -2716,7 +2777,7 @@
       if (f.bomb) {
         const pulse = 0.55 + 0.25 * Math.sin(now / 150);
         ctx.strokeStyle = 'rgba(248,113,113,' + pulse.toFixed(2) + ')';
-        ctx.lineWidth = 2;
+        ctx.lineWidth = fs(2);
         ctx.setLineDash([5, 4]);
         ctx.beginPath();
         ctx.arc(f.x, f.y, f.R + px(PALM_PAD), 0, 6.3);
@@ -2779,14 +2840,14 @@
         ctx.save();
         ctx.setLineDash([6, 6]);
         ctx.strokeStyle = 'rgba(251,191,36,0.45)';
-        ctx.lineWidth = 3;
+        ctx.lineWidth = fs(3);
         ctx.beginPath();
         ctx.moveTo(st.fit.x1, st.fit.y1); ctx.lineTo(st.fit.x2, st.fit.y2);
         ctx.stroke();
         ctx.restore();
         const mx = (st.fit.x1 + st.fit.x2) / 2, my = (st.fit.y1 + st.fit.y2) / 2;
         ctx.fillStyle = 'rgba(251,191,36,0.85)';
-        ctx.font = '600 14px -apple-system,"PingFang TC",sans-serif';
+        ctx.font = '600 ' + fs(14) + 'px -apple-system,"PingFang TC",sans-serif';
         ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
         ctx.fillText('揮大一點', mx, my - 18);
       }
@@ -2800,7 +2861,7 @@
           grad.addColorStop(0, 'rgba(255,255,255,0.05)');
           grad.addColorStop(0.65, 'rgba(255,255,255,0.85)');
           grad.addColorStop(1, 'rgba(255,255,255,0.98)');
-          ctx.strokeStyle = grad; ctx.lineWidth = 9;
+          ctx.strokeStyle = grad; ctx.lineWidth = fs(9);
           ctx.beginPath();
           ctx.moveTo(st.fit.x1, st.fit.y1); ctx.lineTo(st.fit.x2, st.fit.y2); ctx.stroke();
         } else {
@@ -2808,7 +2869,7 @@
           for (let i = 1; i < st.run.length; i++) {
             const age = (now - st.run[i].t) / TRAIL_MS;
             ctx.strokeStyle = 'rgba(255,255,255,' + (0.9 * (1 - age)).toFixed(3) + ')';
-            ctx.lineWidth = 9 * (1 - age) + 2;
+            ctx.lineWidth = fs(9 * (1 - age) + 2);
             ctx.beginPath();
             ctx.moveTo(st.run[i-1].x, st.run[i-1].y);
             ctx.lineTo(st.run[i].x, st.run[i].y); ctx.stroke();
@@ -2819,11 +2880,11 @@
       if (tr.length && bs.length) {
         const t = tr[tr.length-1], b = bs[bs.length-1];
         if (Math.hypot(t.x - b.x, t.y - b.y) > 1) {
-          ctx.strokeStyle = 'rgba(96,165,250,.9)'; ctx.lineWidth = 5;
+          ctx.strokeStyle = 'rgba(96,165,250,.9)'; ctx.lineWidth = fs(5);
           ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(t.x, t.y); ctx.stroke();
         }
         ctx.fillStyle = 'rgba(96,165,250,.95)';
-        ctx.beginPath(); ctx.arc(t.x, t.y, 6, 0, 6.3); ctx.fill();
+        ctx.beginPath(); ctx.arc(t.x, t.y, fs(6), 0, 6.3); ctx.fill();
       }
     }
     drawHud(now);
@@ -2831,10 +2892,10 @@
     if (lostPerson) {
       ctx.fillStyle = 'rgba(8,10,14,.6)'; ctx.fillRect(0, 0, cv.width, cv.height);
       ctx.fillStyle = '#fbbf24';
-      ctx.font = '700 26px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '700 ' + fs(26) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText('看不到你，先暫停', cv.width / 2, cv.height * 0.42);
-      ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '400 ' + fs(15) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.fillStyle = '#9aa3b2';
       ctx.fillText('回到畫面裡就會繼續，水果和分數都留著',
                    cv.width / 2, cv.height * 0.42 + 30);
@@ -2842,7 +2903,7 @@
     } else if (paused) {
       ctx.fillStyle = 'rgba(8,10,14,.72)'; ctx.fillRect(0, 0, cv.width, cv.height);
       ctx.fillStyle = '#e6e8ec';
-      ctx.font = '600 22px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '600 ' + fs(22) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText('暫停中，切回這個分頁就繼續', cv.width / 2, cv.height / 2);
     } else if (phase === 'over') drawGameOver();
@@ -3026,7 +3087,7 @@
     } else {
       const kind = FRUIT[Math.floor(Math.random() * FRUIT.length)];
       const f = {
-        x: cv.width / 2, y: cv.height / 2, vx: 0, vy: -px(0.1),
+        x: cv.width / 2, y: cv.height / 2, vx: 0, vy: -py(0.133),
         ch: kind.ch, color: kind.color,
         bomb: false, dead: false, rot: 0.3, spin: 1.2,
         cuts: [], gen: 0, R: px(F.fruitR),
@@ -3173,7 +3234,7 @@
     ctx.fillRect(0, 0, cv.width, cv.height);
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillStyle = '#e6e8ec';
-    ctx.font = '600 22px -apple-system,"PingFang TC",sans-serif';
+    ctx.font = '600 ' + fs(22) + 'px -apple-system,"PingFang TC",sans-serif';
 
     // 模型還沒載好就沒有圓圈（enterReady 才建立它）。
     // 相機一好就先 phase='ready' 是刻意的 —— 要讓人馬上看到自己 ——
@@ -3181,7 +3242,7 @@
     // 本機模型約 45ms，CDN 要 5–7 秒，後者使用者一定會遇到。
     if (!detector) {
       ctx.fillText('正在準備，稍等一下', cv.width / 2, cv.height * 0.30);
-      ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';
+      ctx.font = '400 ' + fs(15) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.fillStyle = '#9aa3b2';
       ctx.fillText('第一次開比較久，之後就快了', cv.width / 2, cv.height * 0.30 + 30);
       return;
@@ -3189,7 +3250,7 @@
 
     ctx.fillText('把手停在圓圈上', cv.width / 2, cv.height * 0.30);
 
-    ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';
+    ctx.font = '400 ' + fs(15) + 'px -apple-system,"PingFang TC",sans-serif';
     ctx.fillStyle = '#9aa3b2';
     if (!calib) {
       ctx.fillText('確認肩膀、手肘、手腕都在畫面裡', cv.width / 2, cv.height * 0.30 + 30);
@@ -3202,7 +3263,7 @@
     ctx.fillStyle = 'rgba(255,255,255,.15)'; ctx.fillRect(bx, by, bw, 4);
     ctx.fillStyle = calibLockedNow() ? '#4ade80' : '#60a5fa';
     ctx.fillRect(bx, by, bw * (calibLockedNow() ? 1 : calib.w), 4);
-    ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+    ctx.font = '400 ' + fs(12) + 'px -apple-system,"PingFang TC",sans-serif';
     ctx.fillStyle = calibLockedNow() ? '#4ade80' : '#9aa3b2';
     ctx.fillText(calibLockedNow() ? '已依你的身形校正' : '校正中…', cv.width / 2, by + 20);
   }
@@ -3228,7 +3289,7 @@
     phase = 'over';
     syncHint();
     ui.again.hidden = false;
-    hoverBtns = [{ x: cv.width / 2, y: cv.height * 0.62, r: Math.min(76, cv.width * 0.12),
+    hoverBtns = [{ x: cv.width / 2, y: cv.height * 0.62, r: px(0.119),
                    label: '再玩一次', dwell: 0, action: restart }];
     setStatus('把手停在圓圈上，圈走完一輪就重新開始。');
   }
@@ -3238,14 +3299,14 @@
     ctx.fillRect(0, 0, cv.width, cv.height);
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillStyle = '#e6e8ec';
-    ctx.font = '700 44px -apple-system,"PingFang TC",sans-serif';
+    ctx.font = '700 ' + fs(44) + 'px -apple-system,"PingFang TC",sans-serif';
     ctx.fillText('得分 ' + score, cv.width / 2, cv.height * 0.33);
-    ctx.font = '400 18px -apple-system,"PingFang TC",sans-serif';
+    ctx.font = '400 ' + fs(18) + 'px -apple-system,"PingFang TC",sans-serif';
     ctx.fillStyle = score >= best && score > 0 ? '#4ade80' : '#9aa3b2';
     ctx.fillText(score >= best && score > 0 ? '新紀錄' : '最高 ' + best,
                  cv.width / 2, cv.height * 0.33 + 38);
     // 講清楚是怎麼結束的 —— 不然會以為只有炸彈才會死
-    ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';
+    ctx.font = '400 ' + fs(15) + 'px -apple-system,"PingFang TC",sans-serif';
     ctx.fillStyle = '#f87171';
     ctx.fillText('砍到 ' + LIVES + ' 次炸彈', cv.width / 2, cv.height * 0.33 + 64);
   }

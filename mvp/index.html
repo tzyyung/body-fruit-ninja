@@ -2,7 +2,11 @@
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- viewport-fit=cover 一定要有：沒有它的話 env(safe-area-inset-*) 全部解析成 0，
+     瀏海／動態島／home indicator 的避讓完全不會生效（WebKit 官方說明）。
+     不鎖 user-scalable —— 那會擋掉放大，是無障礙問題。 -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
 <title>體感切水果 — 可行性與效能量測</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Ctext y=%2713%27 font-size=%2713%27%3E%F0%9F%8D%89%3C/text%3E%3C/svg%3E">
 
@@ -22,11 +26,44 @@
     --good:#4ade80; --warn:#fbbf24; --bad:#f87171; --accent:#60a5fa;
   }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); min-height:100vh;
-         font:14px/1.5 -apple-system,"Helvetica Neue","PingFang TC",sans-serif; }
+  html { -webkit-text-size-adjust:100%; }   /* iOS 橫向時不要自己放大字 */
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system,"Helvetica Neue","PingFang TC",sans-serif;
+         /* 100vh 在手機上是謊話：瀏覽器用「工具列收起來」的高度算，
+            實際可見區更小，底部會被網址列蓋掉。svh 是「工具列都在」時的高度，
+            拿它當最小高度才不會有一段看不到。舊瀏覽器用 vh 墊底。 */
+         min-height:100vh; min-height:100svh;
+         /* 瀏海／動態島／圓角／home indicator 的避讓 */
+         padding:env(safe-area-inset-top) env(safe-area-inset-right)
+                 env(safe-area-inset-bottom) env(safe-area-inset-left);
+         /* 連點兩下放大會讓「用點的」延遲 300ms，體感遊戲裡那很明顯 */
+         touch-action:manipulation; }
   .wrap { display:flex; gap:16px; padding:16px; align-items:flex-start; flex-wrap:wrap; }
-  .stage { position:relative; flex:1 1 640px; min-width:320px; }
-  canvas { width:100%; height:auto; display:block; background:#000; border-radius:10px; }
+  /* 遊戲畫面必須**整個**看得到才能玩，所以寬跟高要同時約束。
+     原本只有 width:100%，高度由長寬比決定 —— 桌機 1440×900 實測畫布
+     高度 1045px，溢出視窗 145px；iPhone 橫式溢出 220px。
+     做法：由「可用高度 × 長寬比」反推 max-width。
+     --ar 由 JS 在相機解析度確定後寫入（4:3 或 16:9 都可能）。 */
+  .stage { position:relative; flex:1 1 640px; min-width:0;
+           --ar:1.3333;
+           max-width:min(100%, calc((100svh - 2.5rem) * var(--ar))); }
+  @supports not (height: 100svh) {
+    .stage { max-width:min(100%, calc((100vh - 2.5rem) * var(--ar))); }
+  }
+  canvas { width:100%; height:auto; aspect-ratio:var(--ar);
+           display:block; background:#000; border-radius:10px;
+           touch-action:none; }   /* 畫布上要能滑，不要被捲動搶走 */
+
+  /* 收合量測面板。
+     面板是給開發者看的儀器，玩的時候只會佔掉畫面 ——
+     手機直式下它會把 canvas 擠到只剩一條。預設在窄螢幕收起來。
+     用 body 的 class 控制，因為切換鈕在 .stage 裡、面板在它外面。 */
+  .panel-toggle { position:absolute; top:10px; right:10px; z-index:3;
+                  padding:6px 12px; font-size:13px; font-weight:400;
+                  background:rgba(8,10,14,.6); color:var(--fg);
+                  border:1px solid var(--line); border-radius:999px;
+                  backdrop-filter:blur(4px); }
+  .panel-toggle:hover { background:rgba(8,10,14,.85); }
 
   /* 固定寬度用 flex:0 0，不是 width —— width 在 flex 容器裡會被壓掉 */
   .panel { flex:0 0 300px; background:var(--panel); border:1px solid var(--line);
@@ -71,6 +108,26 @@
              font-size:13px; line-height:1.5; }
   .status.err { color:var(--bad); }
 
+  /* ── RWD ───────────────────────────────────────────────────────
+     斷點取 900px：640 的 canvas ＋ 300 的面板 ＋ gap 與 padding
+     剛好需要 988px，低於這個就一定會換行、面板被擠到下面去。 */
+  @media (max-width: 900px) {
+    .wrap { padding:8px; gap:8px; }
+    .panel { flex:1 1 100%; }
+    body:not(.panel-open) .panel { display:none; }
+  }
+  /* 寬螢幕預設顯示；按了收合鈕才隱藏 */
+  @media (min-width: 901px) {
+    body.panel-closed .panel { display:none; }
+  }
+  /* 直式（手機）：提示框的字要小一點，不然會溢出 */
+  @media (max-aspect-ratio: 3/4) {
+    .hint { padding:14px; gap:4px; }
+    .hint b { font-size:15px; }
+    .hint span { font-size:12px; }
+    .hint button { margin-top:10px; padding:12px 26px; font-size:15px; }
+  }
+
   .hint { position:absolute; inset:0; display:grid; place-content:center; text-align:center;
           gap:6px; padding:24px; background:rgba(8,10,14,.72); border-radius:10px; }
   /* display:grid 會蓋掉 hidden 屬性的預設行為，要明寫 */
@@ -85,6 +142,8 @@
 <div class="wrap">
   <div class="stage">
     <canvas id="cv" width="640" height="480"></canvas>
+    <button id="btn-panel" class="panel-toggle ghost" aria-expanded="true"
+            aria-controls="panel">量測</button>
     <div class="hint" id="hint">
       <b>讓肩膀、手肘、手腕都進到畫面裡</b>
       <span>只有砍到炸彈會扣命，三條命用完才結束。漏接不扣命。</span>
@@ -94,7 +153,7 @@
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="panel">
     <h2>量測</h2>
     <dl class="metrics">
       <dt>畫面更新</dt><dd id="m-fps">—</dd>
