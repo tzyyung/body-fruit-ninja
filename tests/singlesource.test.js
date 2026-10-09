@@ -197,6 +197,22 @@ t('drawReady 不拿 detector 當有沒有圓圈的依據',
   /\bdetector\b/.test(body('drawReady')), false);
 t('drawReady 問的是 hoverBtns', /hoverBtns/.test(body('drawReady')), true);
 
+section('量測失敗時要印出數字，不要只說失敗');
+
+// 2026-10-09：使用者按了比對，得到「五秒內沒同時抓到兩邊的手臂」。
+// 那句話把答案丟掉了 —— missA / missB（兩邊各自抓不到幾次）就在手邊，
+// 而那正好能區分「人沒進畫面」和「uint8 偵測不到人」，後者就是當時要查的事。
+// CLAUDE.md §5：抓不到東西時不能沉默，要把數字印出來。
+{
+  const fail = code.slice(code.indexOf('if (!dArm.length)'),
+                          code.indexOf('if (!dArm.length)') + 1600);
+  t('失敗時有印跑了幾輪', /\['跑了幾輪'/.test(fail), true);
+  t('失敗時有印 fp16 抓不到幾次', /missA \+ ' \/ ' \+ frames/.test(fail), true);
+  t('失敗時有印 uint8 抓不到幾次', /missB \+ ' \/ ' \+ frames/.test(fail), true);
+  t('會分辨出「只有 uint8 抓不到」', /missB > missA/.test(fail), true);
+  t('會分辨出「一輪都沒跑完」', /frames === 0/.test(fail), true);
+}
+
 section('量測期間畫面不准沉默');
 
 // 2026-10-09 使用者回報「比對 fp16/uint8 按下去卡住 5 秒、沒有手部圈圈」。

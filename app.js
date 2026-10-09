@@ -3525,9 +3525,31 @@
       const avg = (v) => v.length ? v.reduce((s,n)=>s+n,0)/v.length : NaN;
 
       if (!dArm.length) {
-        showResult([['有效幀', '0']],
-          '五秒內都沒同時抓到兩邊的手臂。站進畫面、讓手肘也入鏡，再按一次。');
-        setStatus('沒量到東西，再試一次。', true);
+        // 這條路上不能只說「沒抓到」。missA / missB 就在手邊，而那才是答案：
+        //   frames 是 0      → 一輪都沒跑完，是速度問題不是站位
+        //   兩邊都抓不到      → 人真的沒進畫面
+        //   只有 uint8 抓不到 → 這就是要比的那件事，直接給結論
+        // 原本一律回「站進畫面、讓手肘也入鏡」—— 把答案丟掉，還怪使用者站錯。
+        let why, tone = 'warn';
+        if (frames === 0) {
+          why = '五秒內一輪都沒跑完，推論比五秒還慢。換成 WebGPU 再試一次。';
+        } else if (missA >= frames && missB >= frames) {
+          why = '兩個模型都完全看不到人。站進畫面、讓肩膀手肘手腕都入鏡，再按一次。';
+        } else if (missB > missA) {
+          why = 'fp16 抓得到、uint8 抓不到 —— 這就是答案：uint8 在這台裝置上'
+              + '偵測不到人，不要用它。';
+          tone = 'bad';
+        } else if (missA > missB) {
+          why = 'uint8 抓得到、fp16 抓不到。這很反常，再按一次確認。';
+        } else {
+          why = '兩邊各自都抓到過，但沒有同時抓到。手不要移出畫面，再按一次。';
+        }
+        showResult([
+          ['跑了幾輪',     String(frames)],
+          ['fp16 抓不到',  missA + ' / ' + frames],
+          ['uint8 抓不到', missB + ' / ' + frames],
+        ], why, tone);
+        setStatus('沒量到可以比的幀，原因在下面。', true);
         return;
       }
 
