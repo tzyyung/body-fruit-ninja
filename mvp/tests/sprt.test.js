@@ -105,6 +105,46 @@ run(8);
 console.log('  揮 8 幀後 Λ=' + track.left.toFixed(2) + ' confirmed=' + confirmed.left);
 t('揮擊期間維持確認', confirmed.left, true);
 
+console.log('\n沒有吸收態 —— 掃過整個狀態空間');
+
+// 這是最重要的一條：不管從哪個狀態出發，只要之後的輸入是
+// 「幾何成立、人站著不動」，就一定要在合理幀數內確認。
+// 只測一個起點不夠 —— 死鎖可能只在特定的 Λ 區間出現。
+{
+  let worst = 0, stuck = [];
+  for (let lam = SPRT_B; lam <= SPRT_A + 1e-9; lam += 0.25) {
+    for (const conf of [false, true]) {
+      for (const hist of [false, true]) {
+        reset();
+        track.left = track.right = lam;
+        confirmed.left = confirmed.right = conf;
+        if (hist) rememberChain('left', kpGood(), 1000);
+        scenario = { chain: true, still: true };
+        let now = 1000, n = 0;
+        while (!confirmed.left && n < 60) { updateTracks(kpGood(), now); now += 33; n++; }
+        if (!confirmed.left) stuck.push('Λ=' + lam.toFixed(2) + ' conf=' + conf + ' hist=' + hist);
+        worst = Math.max(worst, n);
+      }
+    }
+  }
+  console.log('  掃了 ' + (Math.round((SPRT_A - SPRT_B) / 0.25) + 1) * 4
+            + ' 個起始狀態，最慢 ' + worst + ' 幀確認（約 '
+            + Math.round(worst * 33) + 'ms）');
+  t('沒有任何起始狀態會卡住', stuck.length, 0);
+  t('最慢 15 幀（0.5 秒）內要確認', worst <= 15, true);
+  if (stuck.length) console.log('    卡住的：' + stuck.slice(0, 5).join('、'));
+}
+
+console.log('\n幾何成立時，Λ 不可以單調下降');
+// 鏈✓ 的任何組合裡，只要連續性也成立就必須是正的 ——
+// 否則「一條正確又穩定的手臂」會被自己的證據扣分。
+{
+  const dChainStill = llr('chain', true) + llr('cont', true) + llr('strong', false);
+  console.log('  鏈✓續✓強✗ = ' + dChainStill.toFixed(3));
+  t('幾何成立且接得上上一幀時必須加分（即使手腕信心普通）',
+    dChainStill > 0, true);
+}
+
 console.log('\n歷史不可以被清掉（死鎖的來源）');
 reset(); scenario = { chain: true, still: true };
 track.left = SPRT_B;

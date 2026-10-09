@@ -604,6 +604,30 @@
     return true;
   }
 
+  // 掌刀的幾何。抽成純函式是為了能在 node 裡測 ——
+  // 這是整個遊戲最核心的一條式子，不能只靠「看起來對」。
+  //
+  //   掌刀 = 手腕 + K × 前臂投影長 × (手腕 − 基準點 的單位向量)
+  //   K = 10cm ÷ 25cm 前臂 = 0.4
+  //
+  // 兩個刻意的設計：
+  // 1) 位移量用「投影後的前臂長」而不是校正值 —— 手朝鏡頭時真實的 10cm
+  //    在畫面上本來就該縮短，縮到 0 是對的。
+  // 2) 方向在前臂投影夠長時用手肘（最準）；手伸直指向鏡頭時前臂縮成幾個
+  //    像素、方向全是雜訊，改用肩膀→手腕當基線（同一條已驗證的鏈，
+  //    基線長得多）。反對用肩膀的理由是「配到另一隻手的肩膀」，
+  //    鏈驗證過之後就不是那個問題了。
+  function palmPoint(wrist, eb, sh, K, ref) {
+    const foreLen = Math.hypot(wrist.x - eb.x, wrist.y - eb.y);
+    const useElbow = foreLen >= ref * DIR_MIN_FOREARM;
+    const ax = useElbow ? eb.x : sh.x, ay = useElbow ? eb.y : sh.y;
+    const len = Math.hypot(wrist.x - ax, wrist.y - ay) || 1;
+    const off = foreLen * K;
+    return { x: wrist.x + (wrist.x - ax) / len * off,
+             y: wrist.y + (wrist.y - ay) / len * off,
+             foreLen, useElbow, off };
+  }
+
   function bladeFor(side, kp, now) {
     if (ui.stable.checked && !armVisible(side, kp)) return null;
     const mirror = (k) => ({ x: cv.width - k.x, y: k.y, score: k.score });
@@ -635,22 +659,9 @@
       if (eb && sh && hasTrack(side)) {
         const foreLen = Math.hypot(wrist.x - eb.x, wrist.y - eb.y);
         stats.forearm = Math.max(stats.forearm, foreLen);
-
-        // 方向：前臂投影夠長就用前臂（最準）；手伸直朝向鏡頭時前臂縮成
-        // 幾個像素、方向全是雜訊，改用肩膀→手腕 —— 同一條已驗證的鏈，
-        // 基線長得多。（先前反對用肩膀，反對的是「配到另一隻手的肩膀」，
-        // 鏈驗證過之後就不是那個問題了。）
         const ref = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
-        const useElbow = foreLen >= ref * DIR_MIN_FOREARM;
-        const ax = useElbow ? eb.x : sh.x, ay = useElbow ? eb.y : sh.y;
-        const len = Math.hypot(wrist.x - ax, wrist.y - ay) || 1;
-
-        // 位移量用「投影後的前臂長」而不是校正值 ——
-        // 手朝鏡頭時真實的 10cm 在畫面上本來就該縮短，縮到 0 是對的
-        const off = foreLen * K;
-        const x = wrist.x + (wrist.x - ax) / len * off;
-        const y = wrist.y + (wrist.y - ay) / len * off;
-        return { bx:x, by:y, tx:x, ty:y, pad: px(PALM_PAD) };
+        const pt = palmPoint(wrist, eb, sh, K, ref);
+        return { bx:pt.x, by:pt.y, tx:pt.x, ty:pt.y, pad: px(PALM_PAD) };
       }
       // 鏈不成立 → 沒有刀。不做「退化成手腕單點」。
       //
