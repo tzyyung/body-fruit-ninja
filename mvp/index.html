@@ -87,6 +87,7 @@
     <canvas id="cv" width="640" height="480"></canvas>
     <div class="hint" id="hint">
       <b>讓肩膀、手肘、手腕都進到畫面裡</b>
+      <span>只有砍到炸彈會扣命，三條命用完才結束。漏接不扣命。</span>
       <span>坐著或站著都可以，重點是手肘不要出框 —— 掌刀是從手肘算出來的。</span>
       <span>按下面的按鈕後，瀏覽器會問要不要用相機，選允許。</span>
       <button id="btn-start">開啟相機</button>
@@ -394,6 +395,7 @@
   let lives = LIVES, over = false, best = 0;
   let freezeUntil = 0, doubleUntil = 0;
   let comboN = 0, comboAt = 0;
+  let hurtAt = 0, hurtWhy = '', overWhy = '';
   // 滾動樣本。n 越多，量測值的權重越高；一個樣本都沒有就是純預設值。
   let calib = null;
   // idle：還沒開相機 / ready：看得到自己、等懸停開始 / playing：遊戲中 / over：結束
@@ -1111,6 +1113,22 @@
   // 得分與生命值。兩個都畫在 canvas 上 —— 之前得分是 HTML、生命值是 canvas，
   // 兩套畫法混用，結果得分又小又暗，根本沒人注意到。
   function drawHud(now) {
+    // 扣命的那一刻畫面邊緣閃紅。聲音可能被忽略，畫面不會。
+    const hurt = hurtAt ? 1 - Math.min(1, (now - hurtAt) / 500) : 0;
+    if (hurt > 0) {
+      const g = ctx.createRadialGradient(
+        cv.width/2, cv.height/2, Math.min(cv.width, cv.height) * 0.25,
+        cv.width/2, cv.height/2, Math.max(cv.width, cv.height) * 0.62);
+      g.addColorStop(0, 'rgba(248,113,113,0)');
+      g.addColorStop(1, 'rgba(248,113,113,' + (0.55 * hurt).toFixed(3) + ')');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = 'rgba(248,113,113,' + Math.min(1, hurt * 1.6).toFixed(2) + ')';
+      ctx.font = '700 26px -apple-system,"PingFang TC",sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(hurtWhy, cv.width / 2, cv.height * 0.20);
+    }
+
     ctx.save();
     ctx.shadowColor = 'rgba(0,0,0,.85)'; ctx.shadowBlur = 8;
 
@@ -1126,7 +1144,9 @@
     ctx.font = '24px serif';
     let hearts = '';
     for (let i = 0; i < LIVES; i++) hearts += i < lives ? '❤️' : '🖤';
-    ctx.fillText(hearts, cv.width - 14, 14);
+    // 剛扣命時愛心抖一下，視線在別處也會被餘光抓到
+    const shake = hurt > 0 ? Math.sin(now / 24) * 5 * hurt : 0;
+    ctx.fillText(hearts, cv.width - 14 + shake, 14);
 
     // 生效中的寶物：顯示剩幾秒，不然不知道什麼時候會沒
     let y = 50;
@@ -1523,12 +1543,17 @@
     else if (f.treasure === 'life')  lives = Math.min(LIVES, lives + 1);
   }
 
-  function loseLife() {
-    comboN = 0;   // 失手就斷連擊
+  // why 會顯示在畫面上。扣命如果只有一聲低音，玩家不會知道發生了什麼 ——
+  // 這一局就是漏接漏到沒命，但使用者以為只有炸彈才會結束。
+  function loseLife(why) {
+    comboN = 0;
     if (over) return;
     lives--;
+    hurtAt = performance.now();
+    hurtWhy = why || '漏掉了';
     if (lives > 0) { sfx('miss'); return; }
     lives = 0; over = true;
+    overWhy = hurtWhy;
     nextSpawn = Infinity;
     if (score > best) { best = score; saveBest(best); }
     sfx('over');
@@ -1579,7 +1604,13 @@
         if (f.stopFuse) { f.stopFuse(); f.stopFuse = null; }
         // 只有完整的水果沒切到才算漏掉；碎塊落地是正常的
         // 漏掉寶物只是可惜，不該扣命 —— 那是獎勵不是義務
-        if (!f.bomb && !f.treasure && f.gen === 0) { stats.misses++; loseLife(); }
+        // 漏接只計數、不扣命。
+        // 體感追蹤本來就會失誤，漏 3 顆就結束等於在處罰系統自己的問題 ——
+        // 實測一局 9 切 5 漏，命三顆根本撐不過開頭。只有炸彈扣命。
+        if (!f.bomb && !f.treasure && f.gen === 0) {
+          stats.misses++;
+          comboN = 0;   // 漏接仍然中斷連擊，那是技術問題不是處罰
+        }
       } else kept.push(f);
     }
     fruits = kept;
@@ -1609,7 +1640,7 @@
     if (f.bomb) {
       score = Math.max(0, score - 10); stats.bombs++;
       sfx('bomb');
-      loseLife();
+      loseLife('砍到炸彈');
       marks.push({ kind:'boom', x:f.x, y:f.y, t:now, R });
       pops.push({ x: f.x, y: f.y, text: '−10', color: '#f87171', t: now });
       for (let i = 0; i < 18; i++) {
@@ -2391,6 +2422,7 @@
     lives = LIVES;
     score = 0;
     freezeUntil = 0; doubleUntil = 0; comboN = 0;
+    hurtAt = 0; hurtWhy = ''; overWhy = '';
     syncHint();
     fruits = []; bits = []; marks = []; pops = [];
     hoverBtns = [];
@@ -2419,6 +2451,10 @@
     ctx.fillStyle = score >= best && score > 0 ? '#4ade80' : '#9aa3b2';
     ctx.fillText(score >= best && score > 0 ? '新紀錄' : '最高 ' + best,
                  cv.width / 2, cv.height * 0.33 + 38);
+    // 講清楚是怎麼結束的 —— 不然會以為只有炸彈才會死
+    ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillStyle = '#f87171';
+    ctx.fillText('砍到 ' + LIVES + ' 次炸彈', cv.width / 2, cv.height * 0.33 + 64);
   }
 
   function restart() {
