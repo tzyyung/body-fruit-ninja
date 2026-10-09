@@ -1,0 +1,8 @@
+# Playwright MCP 每次操作都會丟快照和主控台紀錄進來，不是原始碼
+.playwright-mcp/
+
+# 模型權重 19MB，而且可以重新下載：mvp/menu.sh models
+# 不進版控，但 menu.sh check 會告訴你在不在
+mvp/models/
+
+.DS_Store
