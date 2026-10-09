@@ -3017,12 +3017,61 @@
     inferLoop(token);
   }
 
+  // 鏡像畫影像。量測用的覆蓋層也要用同一支，不然左右會跟遊戲中相反。
+  function drawMirroredVideo() {
+    ctx.save();
+    ctx.translate(cv.width, 0); ctx.scale(-1, 1);   // 鏡像，讓人像照鏡子
+    ctx.drawImage(video, 0, 0, cv.width, cv.height);
+    ctx.restore();
+  }
+
+  // ---- 量測期間的畫面 ------------------------------------------------------
+  //
+  // 面板上的兩個比較按鈕會連續跑 2–3 個模型、各五秒。那期間 GPU 被吃滿，
+  // rAF 完全排不進來 —— 畫面整個凍住，使用者看不出是在量還是當掉了，
+  // 而且他正被要求「揮動手臂」卻沒有任何回饋。
+  //
+  // 做法：先把遊戲迴圈停掉（不然它會跟這裡搶著畫），量測迴圈每一輪
+  // 自己畫一次。手機上一輪約 234ms（117ms × 2 個模型），所以大約
+  // 每秒更新 4 次，足夠看出它還活著。
+  function pauseForMeasure() {
+    const was = running;
+    running = false;
+    return () => {
+      if (!was) return;
+      running = true; lastVideoTime = -1;
+      startLoops();
+    };
+  }
+
+  function drawMeasuring(title, leftMs, totalMs, n, todo) {
+    if (video.readyState >= 2) drawMirroredVideo();
+    else { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height); }
+    ctx.fillStyle = 'rgba(8,10,14,.62)';
+    ctx.fillRect(0, 0, cv.width, cv.height);
+
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#e6e8ec';
+    ctx.font = '600 ' + fs(20) + 'px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillText(title, px(0.5), py(0.38));
+    ctx.font = '400 ' + fs(15) + 'px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillText(todo || '揮動手臂', px(0.5), py(0.38) + fs(28));
+
+    const bw = px(0.4), bx = px(0.5) - bw / 2, by = py(0.52);
+    ctx.fillStyle = 'rgba(255,255,255,.15)'; ctx.fillRect(bx, by, bw, fs(5));
+    ctx.fillStyle = '#60a5fa';
+    ctx.fillRect(bx, by, bw * Math.min(1, 1 - leftMs / totalMs), fs(5));
+
+    ctx.font = '400 ' + fs(12) + 'px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillStyle = '#9aa3b2';
+    ctx.fillText('還有 ' + Math.ceil(leftMs / 1000) + ' 秒　已取樣 ' + n + ' 次',
+                 px(0.5), by + fs(22));
+  }
+
   function draw(now) {
     if (video.readyState >= 2) {
-      ctx.save();
-      ctx.translate(cv.width, 0); ctx.scale(-1, 1);   // 鏡像，讓人像照鏡子
-      ctx.drawImage(video, 0, 0, cv.width, cv.height);
-      ctx.restore();
+      drawMirroredVideo();
     } else {
       ctx.fillStyle = '#000';
       ctx.fillRect(0, 0, cv.width, cv.height);
@@ -3432,11 +3481,15 @@
   ui.cmp.addEventListener('click', async () => {
     if (!video.videoWidth) { setStatus('要先按「開始」把相機打開。', true); return; }
     ui.cmp.disabled = true;
+    // 遊戲迴圈先停，不然它會跟量測搶 GPU、也會把覆蓋層蓋掉。
+    // 停了之後畫面就只剩這裡畫的東西 —— 所以一定要畫。
+    const resume = pauseForMeasure();
     const ARM = ['left_shoulder','right_shoulder','left_elbow','right_elbow',
                  'left_wrist','right_wrist'];
     let a = null, b = null;
     try {
       setStatus('載入兩個模型…');
+      drawMeasuring('正在載入兩個模型', 1, 1, 0);
       // url 可能是 null（所有來源都抓不到）。null 不能丟給 tfjs ——
       // 它會當成一個網址去抓，要整個不給 modelUrl 才會回去用 tfhub。
       const mk = (url) => poseDetection.createDetector(
@@ -3453,6 +3506,7 @@
       const until = performance.now() + 5000;
       setStatus('揮動手臂五秒，正在比對…');
       while (performance.now() < until) {
+        drawMeasuring('正在比對 fp16 / uint8', until - performance.now(), 5000, frames);
         const pa = (await a.estimatePoses(video, { flipHorizontal:false }))[0];
         const pb = (await b.estimatePoses(video, { flipHorizontal:false }))[0];
         frames++;
@@ -3523,6 +3577,7 @@
       if (a && a.dispose) a.dispose();
       if (b && b.dispose) b.dispose();
       ui.cmp.disabled = false;
+      resume();   // 一定要在 finally —— 中途丟錯的話迴圈就再也不會回來
     }
   });
 
@@ -3660,11 +3715,14 @@
   ui.probe.addEventListener('click', async () => {
     if (!video.videoWidth) { setStatus('要先按「開啟相機」。', true); return; }
     ui.probe.disabled = true;
+    // 同 cmp：量測期間遊戲迴圈要停，而且畫面要自己畫（見 drawMeasuring）
+    const resume = pauseForMeasure();
     const JOINTS = ['left_shoulder','right_shoulder','left_elbow','right_elbow',
                     'left_wrist','right_wrist'];
     const dets = [];
     try {
       setStatus('載入三組模型…');
+      drawMeasuring('正在載入三組模型（含 12MB 的 Thunder）', 1, 1, 0);
       // 同上：null 要變成「不給 modelUrl」，不是「modelUrl 是 null」
       const mk = (type, url) => poseDetection.createDetector(
         poseDetection.SupportedModels.MoveNet,
@@ -3699,6 +3757,8 @@
       setStatus('舉起一隻手停著，正在比較三組設定（5 秒）…');
       const until = performance.now() + 5000;
       while (performance.now() < until) {
+        drawMeasuring('正在比較三組偵測設定', until - performance.now(), 5000, acc[0].n,
+                      '舉起一隻手停著');
         for (let i = 0; i < CFG.length; i++) {
           const p = (await CFG[i].det.estimatePoses(CFG[i].input(),
                       { flipHorizontal: false }))[0];
@@ -3747,6 +3807,7 @@
       console.error(e);
     } finally {
       for (const d of dets) if (d && d.dispose) d.dispose();
+      resume();   // 一定要在 finally —— 中途丟錯的話迴圈就再也不會回來
       ui.probe.disabled = false;
     }
   });

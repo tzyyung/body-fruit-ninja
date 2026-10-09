@@ -197,6 +197,30 @@ t('drawReady 不拿 detector 當有沒有圓圈的依據',
   /\bdetector\b/.test(body('drawReady')), false);
 t('drawReady 問的是 hoverBtns', /hoverBtns/.test(body('drawReady')), true);
 
+section('量測期間畫面不准沉默');
+
+// 2026-10-09 使用者回報「比對 fp16/uint8 按下去卡住 5 秒、沒有手部圈圈」。
+// 那 5 秒是設計好的量測窗，手部圈圈不出現也是對的（跑的是比對用的臨時
+// 模型，遊戲自己的追蹤沒在更新）—— 但它跟「壞掉」長得一模一樣。
+// 兩個比較按鈕都必須：停掉遊戲迴圈、自己畫、而且在 finally 裡復原。
+{
+  const cmp = code.slice(code.indexOf("ui.cmp.addEventListener"),
+                         code.indexOf("ui.probe.addEventListener"));
+  const probe = code.slice(code.indexOf("ui.probe.addEventListener"));
+  for (const [name, blk] of [['比對 fp16/uint8', cmp], ['比較三組設定', probe]]) {
+    t(name + ' 會停掉遊戲迴圈', /const resume = pauseForMeasure\(\);/.test(blk), true);
+    t(name + ' 迴圈裡每一輪都畫', /while \(performance\.now\(\) < until\) \{\s*\n\s*drawMeasuring\(/.test(blk), true);
+    // 中途丟錯的話迴圈就再也不會回來，所以復原一定要在 finally
+    t(name + ' 在 finally 裡復原', /finally \{[\s\S]*?resume\(\);/.test(blk), true);
+  }
+  t('pauseForMeasure 只有一個定義', count('function pauseForMeasure('), 1);
+  t('drawMeasuring 只有一個定義', count('function drawMeasuring('), 1);
+  // 鏡像畫影像只能有一份，不然量測的覆蓋層會跟遊戲中左右相反
+  t('鏡像畫影像只有一個定義', count('function drawMirroredVideo('), 1);
+  t('沒有人再自己鏤一次鏡像',
+    (code.match(/ctx\.translate\(cv\.width, 0\); ctx\.scale\(-1, 1\)/g) || []).length, 1);
+}
+
 section('模型網址只能從一個地方來');
 
 // 面板上的兩個比較按鈕原本寫死 'models/xxx/model.json'，繞過來源賽跑 ——
