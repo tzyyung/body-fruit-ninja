@@ -120,7 +120,7 @@
       <dt>撿到寶物</dt><dd id="m-tre">—</dd>
       <dt>最高連擊</dt><dd id="m-combo">—</dd>
       <dt>爆擊次數</dt><dd id="m-crit">—</dd>
-      <dt>左右手混淆丟幀</dt><dd id="m-lr">—</dd>
+      <dt>兩手重疊丟棄</dt><dd id="m-lr">—</dd>
       <div class="sep"></div>
       <dt>擋下跳動</dt><dd id="m-jump">—</dd>
       <dt>骨長異常</dt><dd id="m-bone">—</dd>
@@ -239,7 +239,11 @@
     //   輕揮 350px/s 被漏掉      0.12→0%    0.15→31%    ← 再高就開始漏真揮擊
     slashMin:  0.12,   // 筆畫要掃過 12% 畫面寬（640 寬時約 77px）才算一刀
     moveSpeed: 0.25,   // 仍保留給「快揮掉點率」的量測用
-    lrMin:     0.016,  // 左右手刀尖靠得比這還近 → 視為左右混淆
+    // 兩把刀靠得比這還近就不可能是兩隻手。
+    // 原本 0.016（640 寬時才 10px）遠遠不夠 —— 單手舉起時模型會替
+    // 另一隻手猜一個位置，常常落在真手旁邊幾十個像素，生出第二把刀。
+    // 實測截圖裡兩把刀相距 90px，舊門檻 10px 完全擋不到。
+    lrMin:     0.11,
     fruitR:    0.053,
   };
   const px = (frac) => frac * cv.width;
@@ -583,6 +587,33 @@
   // 原本三個都強制要，結果坐在桌前、手肘出框時整隻手直接消失 ——
   // 但那時候手明明看得見，掌刀少掉 10cm 的偏移頂多準度差一點，
   // 比完全沒有刀好太多。
+  // 兩條手臂必須用到不同的點。
+  //
+  // chainOK 是各驗各的，所以兩條鏈可以各自「合法」卻用了幾乎同一組點 ——
+  // 單手舉起時模型會替另一隻手猜位置，猜的點常常疊在真手上，
+  // B 就用 A 的點拼出一條看似合法的鏈，一隻手長出兩把刀。
+  //
+  // 最強的訊號是肩膀：兩隻真手的手腕可以靠很近（雙手合十），
+  // 但兩個肩膀永遠不會重疊。肩膀疊在一起就表示模型根本沒在分左右。
+  function armsDistinct(kp) {
+    const sep = (a, b) => (a && b) ? Math.hypot(a.x - b.x, a.y - b.y) : Infinity;
+    const scale = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
+    if (sep(kp.left_shoulder, kp.right_shoulder) < scale * 0.5) return false;
+    if (sep(kp.left_wrist, kp.right_wrist) < scale * 0.45) return false;
+    if (sep(kp.left_elbow, kp.right_elbow) < scale * 0.45) return false;
+    return true;
+  }
+
+  // 哪一邊的證據比較強：三個關節分數相加
+  function armScore(side, kp) {
+    let t = 0;
+    for (const part of ARM) {
+      const k = kp[side + '_' + part];
+      t += k ? k.score : 0;
+    }
+    return t;
+  }
+
   // 兩肩都看得到才有肩寬可用；只看得到一邊就回 0，那道檢查自動略過
   function shoulderWidth(kp) {
     const l = kp.left_shoulder, r = kp.right_shoulder;
@@ -610,9 +641,9 @@
     return true;
   }
 
-  // 唯一的必要條件就是手腕 —— 沒有它就沒有刀。
-  // 手肘和肩膀只影響掌刀「算得準不準」，不影響「有沒有刀」，
-  // 所以那個判斷屬於 bladeFor 的退化階梯，不該放在這裡當入場券。
+  // 手腕過不了就直接不用算了。
+  // 完整的條件是「肩肘腕三點成一條合理的鏈」，那由 bladeFor 的 chainOK 把關；
+  // 這裡只是提早退出，省掉後面的計算。
   function armVisible(side, kp) {
     const w = kp[side + '_wrist'];
     if (!w || w.score < MIN_SCORE) { stats.armHidden++; return false; }
@@ -650,10 +681,15 @@
         const y = wrist.y + (wrist.y - eb.y) * K;
         return { bx:x, by:y, tx:x, ty:y, pad: px(PALM_PAD) };
       }
-      // 鏈不完整或不合理 → 退成手腕單點，不給方向。
-      // 少掉 10cm 偏移還能玩，指錯方向就不能了。
+      // 鏈不成立 → 沒有刀。不做「退化成手腕單點」。
+      //
+      // 鏈不成立時我們沒有任何證據說那個手腕是對的 ——
+      // 不是「位置對、只是少了方向」，而是「這個點可能根本不是手」。
+      // 模型對沒舉起來的那隻手也會猜一個手腕，猜的位置常落在真手旁邊，
+      // 一隻手就長出兩把刀。位置錯的刀比沒有刀糟得多：
+      // 會誤砍炸彈、斷連擊、讓整個遊戲看起來是隨機的。
       stats.chainBroken++;
-      return { bx:wrist.x, by:wrist.y, tx:wrist.x, ty:wrist.y, pad: px(PALM_PAD) };
+      return null;
     }
     if (mode === 'wrist') {
       // posenet_fruit_ninja（★45）就是只追手腕。刀刃退化成一個點，
@@ -1793,6 +1829,15 @@
     stabilize(kp, now);
     feedCalib(kp);
 
+    // 先決定哪幾隻手臂可用，再去算刀刃。
+    // 兩邊的點重疊時，弱的那一邊直接從 kp 裡拿掉 ——
+    // 不能只是「不給它刀」，要讓它完全沒機會沾到另一邊的點。
+    if (!armsDistinct(kp)) {
+      const weak = armScore('left', kp) >= armScore('right', kp) ? 'right' : 'left';
+      for (const part of ARM) delete kp[weak + '_' + part];
+      stats.lrRejects++;
+    }
+
     const blades = { left: bladeFor('left', kp), right: bladeFor('right', kp) };
 
     // 左右手混淆保護：模型在雙手交叉或重疊時會把左右互換，
@@ -1801,11 +1846,16 @@
     if (blades.left && blades.right) {
       const apart = Math.hypot(blades.left.tx - blades.right.tx,
                                blades.left.ty - blades.right.ty);
-      if (apart < px(F.lrMin)) {
-        // 只丟掉信心較低的那一隻。兩隻一起丟的話，
-        // 「只伸一隻手」時模型猜的另一隻會把真的那隻也拖下水。
+      // 有量到身形就用身體尺度：兩隻手的掌刀不會靠得比一個前臂長還近
+      const near = calib && calib.forearm > 4
+        ? Math.max(px(F.lrMin), calib.forearm * 1.1) : px(F.lrMin);
+      if (apart < near) {
+        // 優先留「骨鏈成立」的那一隻 —— 鏈成立代表肩肘腕三點自洽，
+        // 比單看手腕分數可靠得多。兩邊同樣時才比分數。
         const sl = (kp.left_wrist  && kp.left_wrist.score)  || 0;
         const sr = (kp.right_wrist && kp.right_wrist.score) || 0;
+        // 到這裡兩邊都是鏈成立的刀（鏈不成立的在 bladeFor 就被擋掉了），
+        // 所以比手腕分數就好
         if (sl >= sr) blades.right = null; else blades.left = null;
         stats.lrRejects++;
       }
