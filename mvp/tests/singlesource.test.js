@@ -52,9 +52,38 @@ section('關鍵判斷只能有一個入口');
 // 這些函式如果被繞過去（有人自己手刻一份同樣的判斷），
 // 規則就只會生效一部分，而測試照樣綠。
 for (const f of ['bodyScale', 'scoreNeed', 'chainOK', 'armsDistinct',
-                 'weakerArm', 'palmPoint', 'shoulderWidth', 'continuity', 'activeSide']) {
+                 'weakerArm', 'palmPoint', 'shoulderWidth', 'continuity', 'dropOffFrame']) {
   t('函式 ' + f + ' 只定義一次',
     count('function ' + f + '('), 1);
+}
+
+section('接線：每一道關卡都要真的被呼叫');
+
+// 「測得到函式」不等於「函式有被接上」。
+// 2026-10-09 實測：把 dropOffFrame 從 stabilize 拿掉，它自己的 17 條測試
+// 全部照樣綠 —— 因為那些測試是直接呼叫它的。
+// 這是「規則只生效 1/N 而測試還是綠的」那一族，要用機械檢查擋。
+const body = (name) => {
+  const m = code.match(new RegExp('function ' + name + '\\([^)]*\\) \\{[\\s\\S]*?\\n  \\}'));
+  return m ? m[0] : '';
+};
+for (const [gate, caller] of [
+  ['dropOffFrame',  'stabilize'],      // 出框的點要消失
+  ['fixSides',      'stabilize'],      // 左右身分
+  ['gateJumps',     'stabilize'],      // 跳動閘門
+  ['gateBones',     'stabilize'],      // 骨長閘門
+  ['forearmSampleOK', 'feedCalib'],    // 校正樣本的閘門
+  ['chainOK',       'updateTracks'],   // 骨鏈幾何
+  ['continuity',    'updateTracks'],   // 時間連續性
+  ['latch',         'updateTracks'],   // SPRT 鎖存
+  ['armsDistinct',  'ingestPose'],     // 兩條鏈不共用點
+  ['weakerArm',     'ingestPose'],     // 重疊時刪哪一邊
+  ['sweepOf',       'computeStroke'],  // 揮擊量
+  ['segments',      'sweepLen'],       // 分段
+  ['liftChain',     'palm3D'],         // Taylor 逐段還原
+]) {
+  t(caller + '() 裡有呼叫 ' + gate + '()',
+    body(caller).includes(gate + '('), true);
 }
 
 section('自適應量一律走 Tracked，不要手刻 band/dwell');

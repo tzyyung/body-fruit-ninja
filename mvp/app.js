@@ -238,6 +238,7 @@
   function freshStats() {
     return { frames:0, detFrames:0, fastSamples:0, fastDropouts:0, lrRejects:0,
              maxSpeed:0, maxGap:0, bladeLen:0, forearm:0, hits:0, misses:0, bombs:0,
+             offFrame:0,
              linkTries:0, linkOk:0, rejTime:0, rejRange:0, linSum:0, linN:0,
              notSlashing:0, slashTests:0, strokeMax:0, maxGen:0, treasures:0,
              sideFix:0, jumpGate:0, boneGate:0, armHidden:0, chainBroken:0,
@@ -1155,15 +1156,6 @@
 
   let calLast = null;
 
-  // 現在在用的是哪一隻手。
-  // 模型對沒舉起的那隻手一樣會吐出一組座標，分數通常低一截 ——
-  // 用手腕分數高的那邊當「真的那隻」，不設門檻（設了就變成雞生蛋）。
-  function activeSide(kp) {
-    const sl = (kp.left_wrist  && kp.left_wrist.score)  || 0;
-    const sr = (kp.right_wrist && kp.right_wrist.score) || 0;
-    return sl >= sr ? 'left' : 'right';
-  }
-
   // 這一筆「手肘→手腕」的長度，可不可以拿來當校正樣本。
   //
   // 尺規一定要是「不經過任何估計器」的量，所以只能用真的量到的肩寬。
@@ -1181,23 +1173,24 @@
   }
 
   function feedCalib(kp) {
-    // 信心樣本只收「正在用的那隻手」。
+    // 信心門檻的參考點是**肩膀**，不是手肘手腕。
     //
-    // 原本兩隻手一起推進同一個 Tracked，而單手遊玩時每幀固定 2 真 2 幽靈 ——
-    // 雙峰分布的中位數卡在兩群中間的鞍點上，樣本數一點點失衡就整個翻面。
-    // 實機一局量到 MIN_SCORE 在 0.12 ↔ 0.37 之間來回跳（0.12/0.14 共 775 筆、
-    // 0.30 以上一批），肩膀 0.22 的真關節因此每十幀閃一次：
-    // 門檻 0.12 時過、0.30 時不過 → 那幀沒有刀 → prev 歸 null →
-    // 下一點 linked=false → activeRun 只剩一個點 → 刀痕永遠畫不出來。
+    // 這個機制要適應的是「光線」，不是「手在不在」。拿手臂當參考的話，
+    // 手一放下去（或移出畫面），那兩個點只剩模型的猜測值 0.1–0.2，
+    // 中位數跟著掉 → 門檻掉到下限 0.12 → 幽靈手腕 0.18 就過得了
+    // armVisible(0.12) 與 strong(0.18) → **手已經不在了卻還有刀可以切**。
+    // 自適應門檻一路往下追，就變成「永遠有東西過得了門檻」。
     //
-    // 只收一隻手之後分布是單峰的，中位數穩定，門檻跟著那隻手自己的水準走。
-    const act = activeSide(kp);
-    {
-      const e = kp[act + '_elbow'], w = kp[act + '_wrist'];
-      // 不設信心門檻 —— 自動放寬正是為了「拿不到高分」的情況設計的，
-      // 拿高分當入場券就永遠跑不起來。
-      if (e) trk.score.push(e.score);
-      if (w) trk.score.push(w.score);
+    // 肩膀跟手臂舉不舉起無關，人在就在，是獨立的錨點 ——
+    // 所以用它當參考不違反「不能拿高信心當入場券」那條（§4.5）：
+    // 這裡沒有對樣本設門檻，只是換了一個不會因為手放下而消失的來源。
+    //
+    // 係數 0.5 是因為末端關節本來就比肩膀難偵測。實測對得上：
+    //   亮：肩 0.73 → 門檻 0.32（上限）；腕 0.47 過、幽靈腕 0.18 不過
+    //   暗：肩 0.22 → 門檻 0.12（下限）；腕 0.25 過
+    for (const sd of SIDES) {
+      const sh = kp[sd + '_shoulder'];
+      if (sh) trk.score.push(sh.score);
     }
     for (const side of SIDES) {
       const e = kp[side + '_elbow'], w = kp[side + '_wrist'];
@@ -1369,8 +1362,43 @@
     }
   }
 
+  // 出框的點要直接消失，不是「降低權重」。
+  //
+  // 模型不會告訴你出框了 —— MoveNet 永遠回傳 17 個點，出框的會被壓在
+  // 邊界上，位置看起來合法、只是分數低。所以規則是
+  // 「在邊界上**而且**信心不夠」才當作沒有這個點。
+  // 真手確實會揮到畫面邊緣，但那時分數是高的，所以留得下來。
+  //
+  // 在這裡刪（跟跳動閘門同一個地方）而不是在每個消費端各判一次：
+  // 刪掉之後 SPRT 會看到「三個點湊不齊」而往丟棄端推、chainOK 與
+  // armsDistinct 自動略過、bladeFor 拿不到點就沒有刀 —— 一個入口，
+  // 下游全部自動正確。
+  //
+  // 使用者回報：「手已經放下來在螢幕外了，卻仍然被判定有手刀可以切」。
+  const EDGE_MARGIN = 0.25;      // 離邊界多近算在邊緣（身體尺度，約 1/4 前臂）
+  const EDGE_SCORE_MUL = 1.5;    // 在邊緣的話信心要高這麼多倍才留
+
+  function dropOffFrame(kp) {
+    const m = bodyScale(kp) * EDGE_MARGIN;
+    for (const side of SIDES) {
+      for (const part of ARM) {
+        const name = side + '_' + part;
+        const k = kp[name];
+        if (!k) continue;
+        const atEdge = k.x < m || k.y < m
+                    || k.x > cv.width - m || k.y > cv.height - m;
+        if (atEdge && k.score < scoreNeed(part) * EDGE_SCORE_MUL) {
+          delete kp[name];
+          delete joint[name];
+          stats.offFrame++;
+        }
+      }
+    }
+  }
+
   function stabilize(kp, now) {
     if (!ui.stable.checked) return;
+    dropOffFrame(kp);
     fixSides(kp);
     gateJumps(kp, now);
     gateBones(kp, now);
@@ -2344,6 +2372,7 @@
         + ' 鏈=' + (e.chain === undefined ? '—' : e.chain)
         + ' 續=' + (e.cont === undefined ? '—' : e.cont) + '(' + num(e.contVal, 2) + ')'
         + ' 強=' + (e.strong === undefined ? '—' : e.strong)
+
         + ' | 上臂=' + num(c.upper, 0) + ' 前臂=' + num(c.fore, 0)
         + ' 肩寬=' + num(c.shoulderW, 0)
         + ' 上/肩=' + num(c.rU, 2) + '(>1.5擋)'
