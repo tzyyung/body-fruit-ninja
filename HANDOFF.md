@@ -1,29 +1,46 @@
-# 交接：體感切水果 MVP
+# 交接：體感切水果
 
-最後更新 2026-10-09。commit `9eb802a`。
+最後更新 2026-10-09。
 
 這份給下一個接手的人（或 compact 之後的我）。
-**方法與理論看 `docs/METHOD.md`，操作細節看 `mvp/README.md`，
+**第一次看到這個 repo 的人看 `README.md`，
+方法與理論看 `docs/METHOD.md`，操作細節看 `docs/DEV.md`，
 工作規範看 `CLAUDE.md`，這份只寫「現在在哪、下一步做什麼」。**
+
+---
+
+## 0. 檔案位置與線上版
+
+遊戲本體在 **repo 根目錄**（`index.html` + `app.js` + `models/`），
+原本在 `mvp/` 底下，2026-10-09 搬上來 —— GitHub Pages 只能從根目錄或
+`/docs` 發佈，而 `/docs` 要放文件。回退點：`git reset --hard before-github-layout`。
+
+搬動本身是零路徑改動：`menu.sh`／`run.sh` 都是 `cd "$(dirname "$0")"`，
+測試用 `__dirname/../app.js`，搬到根目錄後全部剛好對上。
+
+線上版：**https://tzyyung.github.io/body-fruit-ninja/**
+推上 `main` 就自動部署，沒有 build step、沒有 Actions。
+`.nojekyll` 一定要留著 —— 沒有它 Jekyll 會吃掉 `tests/_harness.js` 這種
+底線開頭的檔案。
 
 ---
 
 ## 1. 現在能跑什麼
 
 ```sh
-cd mvp && ./menu.sh open          # 開（伺服器沒跑會自動起）
+./menu.sh open                    # 開（伺服器沒跑會自動起）
 ./menu.sh check                   # 語法 + 重複 id + CDN + 本機模型
 ./menu.sh models                  # 把模型抓到本機（第一次建議做，開頁從 5.3s → 45ms）
 ```
 
 ```sh
-./menu.sh test                    # 單元測試（12 檔 150 條）
+./menu.sh test                    # 單元測試（11 檔 159 條）
 node tests/bdd.js                 # 驗收條件（36 個 Gherkin 場景）
 ./menu.sh pwlog '關鍵字'          # 看瀏覽器 console（最新那個檔，自動修剪）
 codegraph query / callers / impact  # 查程式，比 grep 準
 ```
 
-純前端（`mvp/index.html` 約 230 行畫面 + `mvp/app.js` 約 3200 行程式），
+純前端（`index.html` 約 230 行畫面 + `app.js` 約 3200 行程式），
 TF.js + MoveNet Lightning。
 流程：點「開啟相機」→ 看到自己 → 手停在圓圈 2 秒 → 開始 → 砍到 3 顆炸彈結束。
 
@@ -311,11 +328,11 @@ TF.js + MoveNet Lightning。
 
 **新增的基礎設施**（下一輪直接用，不要重做）：
 
-- `mvp/tests/_harness.js` —— 抽取樣板集中一處
-- `mvp/tests/gestures.js` —— 動作語料產生器（12 動作 + 3 對照組，固定種子）
-- `mvp/tests/bdd.js` —— 零相依的 Gherkin 執行器（繁中關鍵字）
-- `mvp/features/` —— 驗收條件
-- `mvp/tests/singlesource.test.js` —— **機械檢查**：單一來源、接線、
+- `tests/_harness.js` —— 抽取樣板集中一處
+- `tests/gestures.js` —— 動作語料產生器（12 動作 + 3 對照組，固定種子）
+- `tests/bdd.js` —— 零相依的 Gherkin 執行器（繁中關鍵字）
+- `features/` —— 驗收條件
+- `tests/singlesource.test.js` —— **機械檢查**：單一來源、接線、
   門檻比較走容差、用到 `now` 一定要有 `now`。這檔抓到過好幾個真問題。
 - `docs/METHOD.md` —— 方法與量測，每個數字都附來源
 - 全域 skill：`read-the-running-system`、`corpus-driven-tuning`

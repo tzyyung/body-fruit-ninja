@@ -1,16 +1,22 @@
 # 體感切水果 — 工作規範
 
 用一般視訊鏡頭取代 Kinect 的體感切水果。純前端，TF.js + MoveNet。
-設計細節與量測數字在 `mvp/README.md`，**這份只寫「怎麼動手」**。
+設計細節與量測數字在 `docs/DEV.md`，**這份只寫「怎麼動手」**。
+
+遊戲本體在 repo 根目錄 —— GitHub Pages 只能從根目錄或 `/docs` 發佈，
+`/docs` 放文件，所以 `index.html` 就是首頁，直接可玩。
 
 ```
+index.html       畫面骨架、面板、CDN script 標籤（約 230 行）
+app.js           全部的程式（約 3200 行）
+models/          MoveNet 權重（本機讀 4ms；缺檔會自動回去用 CDN）
+tests/           純邏輯單元測試 + 動作語料 + Gherkin 執行器
+features/        驗收條件（Gherkin，繁中關鍵字）
+menu.sh          start/stop/open/check/test/pwlog/models/quantize
 docs/METHOD.md   方法與量測（像論文那樣寫：理論、公式、為什麼、量到多少）
-mvp/README.md    這裡有什麼、怎麼跑、各項預設值與理由
+docs/DEV.md      這裡有什麼、怎麼跑、各項預設值與理由
 HANDOFF.md       現況與待辦
-mvp/index.html   畫面骨架、面板、CDN script 標籤（約 220 行）
-mvp/app.js       全部的程式（約 3000 行）
-mvp/tests/       純邏輯單元測試 + 動作語料 + Gherkin 執行器
-mvp/features/    驗收條件（Gherkin，繁中關鍵字）
+README.md        給第一次看到這個 repo 的人
 ```
 
 **要改演算法或門檻之前先讀 `docs/METHOD.md`。** 那裡面每個數字都有來源 ——
@@ -39,7 +45,7 @@ codegraph sync .              # 改完程式後重新索引
 ```sh
 git diff                 # 動手前先看自己上次改了什麼
 # ... 改動 ...
-./mvp/menu.sh check      # 語法 + 重複 id + CDN + 本機模型
+./menu.sh check      # 語法 + 重複 id + CDN + 本機模型
 # ... 驗證（見第 3 節）...
 git add -A && git commit
 ```
@@ -106,15 +112,15 @@ git diff HEAD~1          # 或 HEAD~2、HEAD~3
 
 ```sh
 # ① 語法 + 結構
-./mvp/menu.sh check
+./menu.sh check
 
 # ② 純邏輯單元測試（抽函式出來在 node 跑，不需要瀏覽器）
 #    適用：幾何、統計、狀態機、機率。寫成斷言，印出實際數字。
-./mvp/menu.sh test        # 單元測試
-node mvp/tests/bdd.js     # 驗收條件（Gherkin）
+./menu.sh test        # 單元測試
+node tests/bdd.js     # 驗收條件（Gherkin）
 ```
 
-測試放 `mvp/tests/*.test.js`，用 regex 從 `app.js` 抽出函式再 `eval`。
+測試放 `tests/*.test.js`，用 regex 從 `app.js` 抽出函式再 `eval`。
 這樣測的是**正在跑的那份程式**，不是一份會跟著漂走的複本。
 每修一個 bug 就補一條測試，測試名稱寫清楚它在擋什麼情境 ——
 不然同一個洞會再被挖開一次。
@@ -127,11 +133,11 @@ node mvp/tests/bdd.js     # 驗收條件（Gherkin）
 ### ⑦ 變異測試：把修正還原，確認測試真的會紅
 
 ```sh
-cp mvp/app.js /tmp/bak
+cp app.js /tmp/bak
 # ... 把這次的修正改回舊的寫法 ...
-node mvp/tests/x.test.js      # 必須紅
-cp /tmp/bak mvp/app.js
-node mvp/tests/x.test.js      # 必須綠
+node tests/x.test.js      # 必須紅
+cp /tmp/bak app.js
+node tests/x.test.js      # 必須綠
 ```
 
 沒跑過變異的測試不算數 —— 它可能從頭到尾都是綠的，只是擺著好看。

@@ -300,11 +300,24 @@
   }
 
   // ---- 相機 ----------------------------------------------------------------
+  // getUserMedia 只在 secure context 下存在：https、或 localhost。
+  // 用 file:// 開、或用 http:// 連到別台機器（拿手機連電腦 IP 測 RWD 就是這個），
+  // navigator.mediaDevices 整個是 undefined —— 不是權限被拒，是 API 不見了。
+  // 兩個地方要判這件事（開頁先擋、按下開始再擋），所以只留一個來源。
+  const LOCAL_HOSTS = ['localhost', '127.0.0.1', '[::1]', '::1'];
+  function cameraBlockedWhy() {
+    if (location.protocol === 'https:') return '';
+    if (LOCAL_HOSTS.includes(location.hostname)) return '';
+    if (location.protocol === 'file:') {
+      return '用檔案路徑打開沒辦法用相機。請用網址開：線上版的 https 網址，或本機的 http://localhost。';
+    }
+    return '這個網址沒辦法用相機 —— 瀏覽器只允許 https 和 localhost。請換成 https 的網址。';
+  }
+
   async function startCamera() {
-    // getUserMedia 只在 secure context 下存在。用 file:// 開的話
-    // navigator.mediaDevices 整個是 undefined —— 不是權限被拒，是 API 不見了。
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      throw new Error('這個頁面要從 http://localhost 開才能用相機，直接用檔案路徑打開不行。');
+      throw new Error(cameraBlockedWhy() ||
+        '這個瀏覽器沒有相機介面，換 Chrome、Edge 或 Safari 的新版本試試。');
     }
     // 重開相機前先把舊的收掉：不停的話舊 track 仍 live、舊的 rVFC 鏈
     // 會繼續續接（它只看 video.srcObject）、舊 track 的 ended 監聽器
@@ -3541,8 +3554,6 @@
   best = loadBest();
   probeBackends();
   syncBladeOptions();
-  if (location.protocol === 'file:') {
-    setStatus('這個頁面要從 http://localhost 開才能用相機。', true);
-    ui.start.disabled = true;
-  }
+  const blocked = cameraBlockedWhy();
+  if (blocked) { setStatus(blocked, true); ui.start.disabled = true; }
 })();

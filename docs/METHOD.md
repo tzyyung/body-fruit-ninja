@@ -661,16 +661,21 @@ tfjs 預設從 `tfhub.dev` 抓模型，而那會重導到 Kaggle 拿簽章網址
 
 ## 附錄：檔案配置
 
+遊戲本體放在 repo 根目錄，因為 GitHub Pages 只能從根目錄或 `/docs` 發佈。
+
 ```
-mvp/index.html          畫面骨架、面板、CDN script 標籤（約 220 行）
-mvp/app.js              全部的程式（約 3000 行）
-mvp/menu.sh             start/stop/open/check/test/pwlog/models/quantize
-mvp/quantize.py         float16 → uint8 再量化（自己寫的，見 5.2）
-mvp/tests/              純邏輯單元測試（7 檔 100+ 條）
-mvp/tests/gestures.js   動作語料產生器
-mvp/tests/bdd.js        零相依的 Gherkin 執行器（繁中關鍵字）
-mvp/features/           驗收條件（Gherkin）
-docs/METHOD.md          這份
-CLAUDE.md               工作規範：怎麼動手、怎麼驗、踩過的坑
-HANDOFF.md              現況與待辦
+index.html          畫面骨架、面板、CDN script 標籤（約 230 行）
+app.js              全部的程式（約 3200 行）
+models/             MoveNet 權重三組（lightning / lightning-uint8 / thunder）
+menu.sh             start/stop/open/check/test/pwlog/models/quantize
+quantize.py         float16 → uint8 再量化（自己寫的，見 5.2）
+tests/              純邏輯單元測試（11 檔 159 條）
+tests/gestures.js   動作語料產生器
+tests/bdd.js        零相依的 Gherkin 執行器（繁中關鍵字）
+features/           驗收條件（Gherkin）
+docs/METHOD.md      這份
+docs/DEV.md         操作細節、各項預設值與理由
+CLAUDE.md           工作規範：怎麼動手、怎麼驗、踩過的坑
+HANDOFF.md          現況與待辦
+README.md           給第一次看到這個 repo 的人
 ```

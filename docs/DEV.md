@@ -1,8 +1,8 @@
-# 體感切水果 MVP — 可行性與效能量測
+# 開發細節與量測
 
-用一般視訊鏡頭取代 Kinect。目的是量數字，不是做完整遊戲。
+用一般視訊鏡頭取代 Kinect。這份寫「這裡有什麼、怎麼跑、每個預設值是怎麼訂的」。
 
-> **方法與理論的完整說明在 [`../docs/METHOD.md`](../docs/METHOD.md)** ——
+> **方法與理論的完整說明在 [`METHOD.md`](METHOD.md)** ——
 > 那份寫「為什麼這樣做」（SPRT、CUSUM、One Euro、Taylor lifting、
 > gesture spotting、評估方法與結果），這份寫「這裡有什麼、怎麼跑、量到多少」。
 
