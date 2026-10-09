@@ -435,7 +435,7 @@
     const sep = (part) => {
       const need = scoreNeed(part);
       const a = kp['left_' + part], b = kp['right_' + part];
-      if (!a || !b || a.score < need || b.score < need) return Infinity;
+      if (!a || !b || below(a.score, need) || below(b.score, need)) return Infinity;
       return Math.hypot(a.x - b.x, a.y - b.y);
     };
     if (sep('shoulder') < scale * 0.5) return false;
@@ -517,7 +517,7 @@
       const okChain  = chainOK(sh, eb, wr, shoulderWidth(kp), side);
       const contVal  = continuity(side, kp, now);
       const okCont   = contVal > 0.25;
-      const okStrong = wr.score >= MIN_SCORE * 1.5;
+      const okStrong = atLeast(wr.score, MIN_SCORE * 1.5);
       evLast[side] = { chain: okChain, cont: okCont, contVal, strong: okStrong };
       // 三項證據不是條件獨立的。
       //
@@ -571,6 +571,21 @@
     return px(0.09);
   }
 
+  // ── 單一來源：門檻比較 ────────────────────────────────────────────
+  //
+  // 浮點數的門檻一律走這兩支，不要直接寫 >= 或 <。
+  //
+  // 門檻幾乎都是算出來的（0.20 × 1.15 × 1.5 …），而
+  // 0.20 * 1.5 === 0.30000000000000004 —— 「剛好到門檻」的那個值會隨著
+  // 算式的寫法落在兩邊，同一個分數在兩個地方得到不同結論。
+  // 遊戲裡這不會爆炸，但會變成「偶爾有一幀沒有刀」這種查不出來的毛病，
+  // 而且測試會卡在無法解釋的邊界上。
+  //
+  // 容差取 1e-9：信心分數與像素都遠大於這個量級，不會蓋掉真實差異。
+  const EPS = 1e-9;
+  const atLeast = (v, min) => v >= min - EPS;   // 達到門檻（含剛好）
+  const below   = (v, min) => v <  min - EPS;   // 未達門檻
+
   // 這個關節要多少信心才算數。手肘要比手腕嚴，因為掌刀 = 手腕 + K×(手腕−手肘)，
   // 手肘的誤差會被放大帶進來。
   function scoreNeed(part) {
@@ -586,7 +601,7 @@
   // 寧可少一道檢查，也不要一道會自我汙染的檢查。
   function shoulderWidth(kp) {
     const l = kp.left_shoulder, r = kp.right_shoulder;
-    if (!l || !r || l.score < MIN_SCORE || r.score < MIN_SCORE) return 0;
+    if (!l || !r || below(l.score, MIN_SCORE) || below(r.score, MIN_SCORE)) return 0;
     return Math.hypot(l.x - r.x, l.y - r.y);
   }
 
@@ -642,7 +657,7 @@
   // 這裡只是提早退出，省掉後面的計算。
   function armVisible(side, kp) {
     const w = kp[side + '_wrist'];
-    if (!w || w.score < MIN_SCORE) {
+    if (!w || below(w.score, MIN_SCORE)) {
       stats.armHidden++;
       noBlade[side] = '手腕看不清楚 —— 手舉高一點';
       return false;
@@ -694,7 +709,7 @@
     const mirror = (k) => ({ x: cv.width - k.x, y: k.y, score: k.score });
     const get = (n) => {
       const k = kp[side + '_' + n];
-      return k && k.score >= scoreNeed(n) ? mirror(k) : null;
+      return k && atLeast(k.score, scoreNeed(n)) ? mirror(k) : null;
     };
     const wrist = get('wrist');
     if (!wrist) { noBlade[side] = '手腕看不清楚 —— 手舉高一點'; return null; }
@@ -1196,7 +1211,7 @@
       const e = kp[side + '_elbow'], w = kp[side + '_wrist'];
       // 前臂樣本的門檻跟著 MIN_SCORE 走，不要寫死 0.25 ——
       // MIN_SCORE 會自動降到 0.12，寫死的話暗房裡刀能用但校正永遠不啟動。
-      if (!e || !w || e.score < MIN_SCORE || w.score < MIN_SCORE) continue;
+      if (!e || !w || below(e.score, MIN_SCORE) || below(w.score, MIN_SCORE)) continue;
       const len = Math.hypot(e.x - w.x, e.y - w.y);
       // 用當幀的肩寬把明顯不是手臂的樣本擋掉。
       //
@@ -1222,7 +1237,9 @@
     const inRest = readyAt && performance.now() - readyAt < REST_MS;
     if (inRest && !trk.forearm.settled) {
       const w = kp.right_wrist || kp.left_wrist;
-      if (w && w.score >= 0.25) {
+      // 門檻跟著 MIN_SCORE 走，不要寫死。寫死 0.25 的話，
+      // 暗房裡 MIN_SCORE 降到 0.12、刀能用，雜訊地板卻永遠量不到。
+      if (w && atLeast(w.score, MIN_SCORE)) {
         if (calLast) trk.noise.push(Math.hypot(w.x - calLast.x, w.y - calLast.y));
         calLast = { x: w.x, y: w.y };
       }
@@ -1322,7 +1339,7 @@
       for (const part of ARM) {
         const name = side + '_' + part;
         const k = kp[name];
-        if (!k || k.score < MIN_SCORE) { delete joint[name]; continue; }
+        if (!k || below(k.score, MIN_SCORE)) { delete joint[name]; continue; }
         const p = joint[name];
         if (p) {
           const dt = Math.max((now - p.t) / 1000, 1e-3);
@@ -1387,7 +1404,7 @@
         if (!k) continue;
         const atEdge = k.x < m || k.y < m
                     || k.x > cv.width - m || k.y > cv.height - m;
-        if (atEdge && k.score < scoreNeed(part) * EDGE_SCORE_MUL) {
+        if (atEdge && below(k.score, scoreNeed(part) * EDGE_SCORE_MUL)) {
           delete kp[name];
           delete joint[name];
           stats.offFrame++;
@@ -2760,9 +2777,9 @@
       const mark = (side) => {
         const sh = kp[side + '_shoulder'], eb = kp[side + '_elbow'],
               wr = kp[side + '_wrist'];
-        if (!wr || wr.score < MIN_SCORE) return '無手腕';
-        if (!sh || !eb || sh.score < MIN_SCORE
-            || eb.score < scoreNeed('elbow')) return '只有腕';
+        if (!wr || below(wr.score, MIN_SCORE)) return '無手腕';
+        if (!sh || !eb || below(sh.score, MIN_SCORE)
+            || below(eb.score, scoreNeed('elbow'))) return '只有腕';
         return chainOK(sh, eb, wr, sw) ? '成立' : '不合理';
       };
       ui.chain2.textContent = mark('left') + ' / ' + mark('right');

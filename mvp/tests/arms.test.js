@@ -10,6 +10,7 @@ const LR_SCORE_MARGIN = H.num('LR_SCORE_MARGIN');
 const FORE_OVER_SHOULDER = H.num('FORE_OVER_SHOULDER');
 const px = (r) => r * 640;
 let calib = { forearm: 185 };
+const { atLeast, below } = H;   // 跟 app.js 同一組容差比較
 eval(H.fn('shoulderWidth'));
 eval(H.fn('bodyScale'));
 eval(H.fn('scoreNeed'));          // 不存在就讓 harness 報錯，不要無聲略過

@@ -22,6 +22,7 @@ let joint = {};
 let stats = { offFrame: 0 };
 eval(H.fn('shoulderWidth'));
 eval(H.fn('bodyScale'));
+const { atLeast, below } = H;   // 跟 app.js 同一組容差比較
 eval(H.fn('scoreNeed'));
 eval(H.fn('dropOffFrame'));
 
@@ -66,7 +67,7 @@ section('邊界剛好的那一刀');
 for (const [name, y, score, keep] of [
   ['剛好在邊緣帶外、低分', M + 1, 0.18, true],
   ['剛好在邊緣帶內、低分', M - 1, 0.18, false],
-  ['邊緣帶內、剛好到門檻×1.5', M - 1, MIN_SCORE * EDGE_SCORE_MUL, true],
+  ['邊緣帶內、剛好到門檻×1.5（容差要讓它過）', M - 1, MIN_SCORE * EDGE_SCORE_MUL, true],
   ['邊緣帶內、差一點點', M - 1, MIN_SCORE * EDGE_SCORE_MUL - 0.01, false],
 ]) {
   const kp = base();
@@ -90,13 +91,15 @@ section('手肘的門檻比手腕嚴（掌刀算式會放大手肘誤差）');
 
 {
   const kp = base();
-  // 0.32 過得了手腕的邊緣門檻（0.20×1.5＝0.30），
-  // 過不了手肘的（0.20×1.15×1.5＝0.345）
-  kp.left_wrist = P(205, 476, 0.32);
-  kp.left_elbow = P(215, 476, 0.32);
+  // 剛好 0.30：過得了手腕的邊緣門檻（0.20×1.5），
+  // 過不了手肘的（0.20×1.15×1.5＝0.345）。
+  // 「剛好等於門檻」要算通過 —— 這是容差比較存在的理由：
+  // 0.20 * 1.5 === 0.30000000000000004，直接用 < 比的話這一條會紅。
+  kp.left_wrist = P(205, 476, 0.30);
+  kp.left_elbow = P(215, 476, 0.30);
   run(kp);
-  t('同樣 0.32：手腕留著', kp.left_wrist !== undefined, true);
-  t('同樣 0.32：手肘被刪（門檻多乘 ' + ELBOW_SCORE_MUL + '）',
+  t('剛好在門檻上（0.30）：手腕留著', kp.left_wrist !== undefined, true);
+  t('同樣 0.30：手肘被刪（門檻多乘 ' + ELBOW_SCORE_MUL + '）',
     kp.left_elbow === undefined, true);
 }
 

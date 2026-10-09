@@ -57,10 +57,16 @@ function t(name, got, want) {
 
 const near = (a, b, tol) => Math.abs(a - b) <= tol;
 
+// 跟 app.js 同一組容差比較。測試與程式用不同的比較規則，
+// 就會在邊界上得到不同結論，而那正是最需要測的地方。
+const EPS = 1e-9;
+const atLeast = (v, min) => v >= min - EPS;
+const below   = (v, min) => v <  min - EPS;
+
 function done() {
   console.log(fails ? '\n' + fails + '/' + total + ' 項失敗'
                     : '\n全部通過（' + total + ' 項）');
   process.exit(fails ? 1 : 0);
 }
 
-module.exports = { src, fn, expr, num, section, t, near, done };
+module.exports = { src, fn, expr, num, section, t, near, atLeast, below, done };

@@ -33,6 +33,7 @@ const shoulderWidth = () => 200;
 // 人站著不動 → 有歷史就接得上；沒有歷史一定是 0。
 const continuity = (side) => (chainHist[side] && scenario.still) ? 0.95 : 0;
 
+const { atLeast, below } = H;   // 跟 app.js 同一組容差比較
 eval(H.fn('latch'));
 eval(H.fn('rememberChain'));
 eval(H.fn('updateTracks'));

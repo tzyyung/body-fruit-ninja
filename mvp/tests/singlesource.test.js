@@ -57,6 +57,23 @@ for (const f of ['bodyScale', 'scoreNeed', 'chainOK', 'armsDistinct',
     count('function ' + f + '('), 1);
 }
 
+section('門檻比較一律走容差函式');
+
+// 門檻幾乎都是算出來的（0.20 × 1.15 × 1.5 …），而
+// 0.20 * 1.5 === 0.30000000000000004 —— 直接用 < 比，「剛好到門檻」
+// 會隨算式寫法落在兩邊，同一個分數在兩個地方得到不同結論。
+// 這種毛病的症狀是「偶爾有一幀沒有刀」，查不出來。
+{
+  const raw = code.split('\n')
+    .map((l, i) => [i + 1, l])
+    // 兩個分數互比（挑比較高的那個）不是門檻比較，不在此限
+    .filter(([, l]) => /\.score\s*[<>]=?[^=]/.test(l) && !/\.score\s*[<>]=?\s*\w+\.score/.test(l))
+    .map(([i, l]) => i + ': ' + l.trim().slice(0, 60));
+  t('沒有直接拿 .score 跟門檻比的地方（要用 atLeast / below）',
+    raw.length ? raw.join(' ｜ ') : 0, 0);
+}
+t('容差只有一個定義', count('const EPS ='), 1);
+
 section('接線：每一道關卡都要真的被呼叫');
 
 // 「測得到函式」不等於「函式有被接上」。
