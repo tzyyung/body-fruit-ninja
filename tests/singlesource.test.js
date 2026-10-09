@@ -132,6 +132,71 @@ for (const [gate, caller] of [
     body(caller).includes(gate + '('), true);
 }
 
+section('基本運算只能有一個定義，不准各自內聯');
+
+// 2026-10-09 掃出來的：dist(a,b) 被定義了兩次（armsDistinct 裡一份、
+// 關節穩定化那一節一份），另外還有十幾處各自寫 Math.hypot(a.x-b.x, a.y-b.y)。
+// 更糟的是 linkInfo 裡有一個叫 dist 的「數字」把外層的 dist() 遮掉 ——
+// 之後在那支函式裡寫 dist(a,b) 會變成「不是函式」。
+t('dist 只定義一次', count('const dist ='), 1);
+t('TAU 只定義一次', count('const TAU ='), 1);
+t('dtSec 只定義一次', count('const dtSec ='), 1);
+// 1 = dist 自己的定義。多出來的每一個都是複製貼上。
+t('兩點距離只在 dist 的定義裡出現',
+  (code.match(/Math\.hypot\(\w+\.x - \w+\.x, \w+\.y - \w+\.y\)/g) || []).length, 1);
+t('沒有人再寫 6.3 當整圓', count('6.3)'), 0);
+// 1 = dtSec 自己的定義
+t('幀間秒數只在 dtSec 的定義裡出現',
+  (code.match(/Math\.max\(\([\w. -]+\) \/ 1000, 1e-3\)/g) || []).length, 1);
+
+// 正規式換字串時把定義本身也換掉 → const f = (a,b) => f(a,b)
+// 語法合法、node --check 過，但一呼叫就 RangeError。實際踩過兩次（dist、dtSec）。
+{
+  const bad = [...code.matchAll(/const (\w+) = \([^)]*\) => ([\s\S]*?);\n/g)]
+    .filter((m) => new RegExp('\\b' + m[1] + '\\(').test(m[2]))
+    .map((m) => m[1]);
+  t('沒有自己呼叫自己的一行定義', bad.length ? bad.join('、') : 0, 0);
+}
+
+// 測試抽出來的函式會用到這些基本運算，少一行就整檔 ReferenceError。
+// 入口統一在 H.core()，不要每個測試檔各自補一份。
+{
+  const fs2 = require('fs'), path2 = require('path');
+  const roots = [path2.join(__dirname), path2.join(__dirname, '..', 'features', 'steps')];
+  const missing = [];
+  for (const dir of roots) {
+    for (const f of fs2.readdirSync(dir)) {
+      if (!/\.(test|steps)\.js$/.test(f)) continue;
+      const body = fs2.readFileSync(path2.join(dir, f), 'utf8');
+      if (!/H\.(fn|expr)\(/.test(body)) continue;      // 沒抽原始碼的不需要
+      if (!body.includes('H.core()')) missing.push(f);
+    }
+  }
+  t('每個抽原始碼的測試都接上 H.core()', missing.length ? missing.join('、') : 0, 0);
+}
+
+section('三種尺度一律走 px / py / fs');
+
+// §4.3：絕對像素、畫面寬比例、身體尺度是三種不同的東西，用錯會無聲壞掉。
+// px()/py()/fs() 就是這三者的入口，但原本有 45 處直接寫 cv.width * 0.28、
+// cv.height * 0.30、cv.width / 2 —— 等於入口形同虛設，而且下一個人很容易
+// 把垂直錨點寫成 cv.width * r（4:3 下看起來還「差不多對」，16:9 下整個歪）。
+//
+// 允許的例外只有四處：fs 的定義、兩處長寬比、滑鼠座標對應。
+{
+  const raw = (H.src.match(/cv\.(?:width|height) ?[*/] ?[0-9.]+/g) || [])
+    .filter((x) => !/\/ ?640$/.test(x));
+  t('沒有人直接拿 cv.width/height 乘除數字', raw.length ? raw.join('、') : 0, 0);
+}
+
+section('localStorage 只能有一個出入口');
+
+// §4.8：localStorage 在無痕視窗會**丟錯**而不是回 null。
+// 原本五個呼叫點各自包一次 try/catch，第六個忘了包的話整頁當場死掉。
+t('localStorage 只在 store 裡被碰到', count('localStorage.'), 2);
+t('store 的讀有 try', /get\(key\) \{ try \{/.test(code), true);
+t('store 的寫有 try', /set\(key, val\) \{ try \{/.test(code), true);
+
 section('記住偏好只能在使用者真的選了之後');
 
 // 2026-10-09 量到的：setPanel 無條件寫 localStorage，於是「還沒選過」

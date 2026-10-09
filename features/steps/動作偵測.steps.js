@@ -22,6 +22,8 @@ let ARM = FOREARM * ARM_OVER_FOREARM;
 const SH = { x: 320, y: 430 };
 const maxSpeedPx = () => FOREARM * SPEED_FOREARM;
 
+// app.js 的基本運算（dist / dtSec / TAU）—— 抽出來的函式會用到
+eval(H.core());
 eval(H.fn('linkInfo'));
 eval(H.fn('activeRun'));
 eval(H.fn('fitLine'));

@@ -12,6 +12,8 @@ const MAX_LINK_MS = H.num('MAX_LINK_MS');
 let CANVAS_W = 640;
 const px = (r) => r * CANVAS_W;
 const maxSpeedPx = () => 151 * H.num('SPEED_FOREARM');   // 校正鎖定後的跳動上限
+// app.js 的基本運算（dist / dtSec / TAU）—— 抽出來的函式會用到
+eval(H.core());
 eval(H.fn('linkInfo'));
 eval(H.fn('activeRun'));
 eval(H.fn('fitLine'));

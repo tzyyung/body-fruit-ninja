@@ -20,6 +20,8 @@ const px = (r) => r * cv.width;
 let calib = { forearm: 150 };
 let joint = {};
 let stats = { offFrame: 0 };
+// app.js 的基本運算（dist / dtSec / TAU）—— 抽出來的函式會用到
+eval(H.core());
 eval(H.fn('shoulderWidth'));
 eval(H.fn('bodyScale'));
 const { atLeast, below } = H;   // 跟 app.js 同一組容差比較

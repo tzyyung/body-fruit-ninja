@@ -6,6 +6,8 @@ const { t, section, near, done } = H;
 const FOREARM_CM = H.num('FOREARM_CM'), PALM_CM = H.num('PALM_CM'), TIP_CM = H.num('TIP_CM');
 const PALM_K = PALM_CM / FOREARM_CM, TIP_K = TIP_CM / FOREARM_CM;
 const DIR_MIN_FOREARM = H.num('DIR_MIN_FOREARM');
+// app.js 的基本運算（dist / dtSec / TAU）—— 抽出來的函式會用到
+eval(H.core());
 eval(H.fn('palmPoint'));
 
 const P = (x, y) => ({ x, y });

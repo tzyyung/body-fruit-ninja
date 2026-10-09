@@ -12,6 +12,8 @@ const FORE_VS_SHOULDER_HI  = H.num('FORE_VS_SHOULDER_HI');
 const FORE_VS_SHOULDER_LO  = H.num('FORE_VS_SHOULDER_LO');
 let calib = null;
 const chainWhy = { left: null, right: null };
+// app.js 的基本運算（dist / dtSec / TAU）—— 抽出來的函式會用到
+eval(H.core());
 const median = eval(H.expr('median'));
 const pctile = eval(H.expr('pctile'));
 eval(H.fn('chainOK'));

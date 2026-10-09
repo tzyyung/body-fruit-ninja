@@ -50,8 +50,12 @@ console.log('  面積比：炸彈判定 / 看得見 = '
 
 section('畫出來的危險圈要跟判定同一個值');
 
-t('drawFruits 用 f.R + px(PALM_PAD) 畫圈',
-  H.src.includes('ctx.arc(f.x, f.y, f.R + px(PALM_PAD), 0, 6.3)'), true);
+// 只鎖「半徑跟判定用同一個運算式」。
+// 原本連後面的角度 0, 6.3 一起鎖進去 —— 那跟這條規則無關，
+// 結果把 6.3 改成 TAU（整圓的單一來源）時這條就紅了，
+// 等於用測試把一個不相干的寫法釘死。
+t('drawFruits 畫的半徑跟判定用同一個運算式',
+  H.src.includes('ctx.arc(f.x, f.y, f.R + px(PALM_PAD),'), true);
 t('testSlices 用 f.R + pad 判定',
   H.src.includes('< f.R + pad'), true);
 

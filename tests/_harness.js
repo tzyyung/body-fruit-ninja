@@ -36,6 +36,25 @@ function expr(name) {
   return '(' + m[1].replace(/;\s*$/, '') + ')';
 }
 
+// app.js 裡「每個人都會用到」的基本運算（TAU / dist / dtSec）。
+//
+// 抽出來的函式只要用到其中一個，測試檔就會 ReferenceError —— 實測過：
+// linkInfo 改用 dtSec() 之後 motion 和 stroke 兩檔同時紅。
+// 與其每個測試檔各自補一行，不如在這裡給一個統一入口：
+//   eval(H.core());
+//
+// 為什麼要把 const 換成 var：直接 eval 裡的 const/let 是 eval 自己的
+// 區塊作用域，外面拿不到（harness 開頭那段註解講的就是這件事）。
+// var 會掛到呼叫端的函式／模組作用域，所以取得出來。
+const CORE = ['TAU', 'dist', 'dtSec'];
+function core() {
+  return CORE.map((name) => {
+    const m = src.match(new RegExp('\\n  const ' + name + ' = (.*?);\\n'));
+    if (!m) die('抽不到基本運算 ' + name);
+    return 'var ' + name + ' = ' + m[1] + ';';
+  }).join('\n');
+}
+
 // 取數字常數
 function num(name) {
   const m = src.match(new RegExp('const ' + name + '\\s*=\\s*([\\d.]+)'));
@@ -69,4 +88,4 @@ function done() {
   process.exit(fails ? 1 : 0);
 }
 
-module.exports = { src, fn, expr, num, section, t, near, atLeast, below, done };
+module.exports = { src, fn, expr, core, num, section, t, near, atLeast, below, done };

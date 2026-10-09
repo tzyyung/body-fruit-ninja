@@ -15,6 +15,8 @@ const TRAIL_MS = H.num('TRAIL_MS');
 const SLASH_FOREARM = H.num('SLASH_FOREARM');
 let CANVAS_W = 640;
 const px = (r) => r * CANVAS_W;
+// app.js 的基本運算（dist / dtSec / TAU）—— 抽出來的函式會用到
+eval(H.core());
 eval(H.fn('linkInfo'));
 eval(H.fn('activeRun'));
 eval(H.fn('fitLine'));

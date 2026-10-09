@@ -12,6 +12,8 @@ const { t, section, done } = H;
 const SPRT_ALPHA = 0.01, SPRT_BETA = 0.05;
 const SPRT_A = Math.log((1 - SPRT_BETA) / SPRT_ALPHA);
 const SPRT_B = Math.log(SPRT_BETA / (1 - SPRT_ALPHA));
+// app.js 的基本運算（dist / dtSec / TAU）—— 抽出來的函式會用到
+eval(H.core());
 const EV = eval(H.expr('EV'));
 const llr = eval(H.expr('llr'));
 const SIDES = ['left', 'right'];

@@ -36,6 +36,8 @@ const chainWhy = { left: null, right: null };
 const noBlade = { left: '', right: '' };
 const stats = { lrRejects: 0, chainBroken: 0, armHidden: 0, forearm: 0 };
 
+// app.js 的基本運算（dist / dtSec / TAU）—— 抽出來的函式會用到
+eval(H.core());
 const EV  = eval(H.expr('EV'));
 const llr = eval(H.expr('llr'));
 const { atLeast, below } = H;   // 跟 app.js 同一組容差比較

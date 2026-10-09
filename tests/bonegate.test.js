@@ -15,9 +15,10 @@ const BONE_HI = Number(H.src.match(/BONE_HI = ([\d.]+)/)[1]);
 const HOLD_MAX_MS = H.num('HOLD_MAX_MS');
 const BONE_RESET_MS = H.num('BONE_RESET_MS');
 const SIDES = ['left', 'right'];
-const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 let boneMed = {}, joint = {}, stats = { boneGate: 0 };
 const heldSince = {};
+// app.js 的基本運算（dist / dtSec / TAU）—— 抽出來的函式會用到
+eval(H.core());
 eval(H.fn('heldFor'));
 eval(H.fn('boneMedian'));
 eval(H.fn('pushBone'));
