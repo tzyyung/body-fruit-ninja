@@ -128,6 +128,7 @@
       <dt>手臂不可信</dt><dd id="m-arm">—</dd>
       <dt>骨鏈不成立</dt><dd id="m-chain">—</dd>
       <dt>左手／右手鏈</dt><dd id="m-chain2">—</dd>
+      <dt>目前狀態</dt><dd id="m-state">—</dd>
       <div class="sep"></div>
       <dt>刀痕成立率</dt><dd id="m-link">—</dd>
       <dt>擋掉：沒揮出一刀</dt><dd id="m-rej-move">—</dd>
@@ -360,7 +361,7 @@
     miss:el('m-miss'), bomb:el('m-bomb'), tre:el('m-tre'),
     combo:el('m-combo'), crit:el('m-crit'), lr:el('m-lr'),
     jump:el('m-jump'), bone:el('m-bone'), side:el('m-side'), arm:el('m-arm'),
-    chain:el('m-chain'), chain2:el('m-chain2'),
+    chain:el('m-chain'), chain2:el('m-chain2'), state:el('m-state'),
     link:el('m-link'), rejMove:el('m-rej-move'), rejTime:el('m-rej-time'),
     rejRange:el('m-rej-range'), gapAvg:el('m-gapavg'), lin:el('m-lin'),
     stroke:el('m-stroke'), gen:el('m-gen'),
@@ -379,7 +380,7 @@
   let detector = null, running = false, lastVideoTime = -1, lastPose = null;
   let backendReady = false, panelBroken = false, modelSource = '—';
   let warmupMs = 0;
-  let paused = false, lastFrameAt = 0, lastFrameTime = -1, lastPoseAt = 0;
+  let paused = false, lastFrameAt = 0, lastFrameTime = -1;
   let readyAt = 0;
   // requestVideoFrameCallback 會在「真的有新影格」時觸發，
   // 比輪詢 video.currentTime 精確，而且 presentedFrames 可以算出漏了幾格。
@@ -396,6 +397,12 @@
   let freezeUntil = 0, doubleUntil = 0;
   let comboN = 0, comboAt = 0;
   let hurtAt = 0, hurtWhy = '', overWhy = '';
+  // 判斷「有沒有人」用的是「有沒有可用的刀刃」，不是「有沒有回傳姿勢」——
+  // 模型可能回傳一個信心很低、關節全錯的姿勢，那對玩家來說等於沒人。
+  const NO_PERSON_MS = 1200;
+  let lastBladeAt = 0, lostPerson = false;
+  // 示範按鈕是沒有相機時的開發工具，不該被「沒看到人」擋住
+  let demoMode = false;
   // 滾動樣本。n 越多，量測值的權重越高；一個樣本都沒有就是純預設值。
   let calib = null;
   // idle：還沒開相機 / ready：看得到自己、等懸停開始 / playing：遊戲中 / over：結束
@@ -1592,6 +1599,18 @@
     });
   }
 
+  // 沒人的時候水果凍住，但果汁、閃光這些殘留特效要讓它們播完，
+  // 不然畫面會卡著一堆半透明的東西
+  function stepEffectsOnly(dt) {
+    const g = px(GRAVITY_F);
+    bits = bits.filter((b) => {
+      b.vy += g * dt; b.x += b.vx * dt; b.y += b.vy * dt;
+      return b.y < cv.height + 20 && performance.now() - b.t < 900;
+    });
+    marks = marks.filter((m) => performance.now() - m.t < (m.kind === 'boom' ? 420 : 200));
+    pops = pops.filter((p) => { p.y -= 46 * dt; return performance.now() - p.t < 700; });
+  }
+
   function stepFruits(dt) {
     // 慢動作只放慢水果，手的追蹤與刀痕維持原速 —— 不然會變成整個遊戲變鈍
     if (performance.now() < freezeUntil) dt *= 0.42;
@@ -1828,7 +1847,7 @@
         prev[side] = null;
       }
     }
-    if (any) stats.detFrames++;
+    if (any) { stats.detFrames++; lastBladeAt = now; }
   }
 
   // 推論迴圈：唯一會 await 的地方，不在 rAF 裡
@@ -1907,13 +1926,13 @@
       return;
     }
 
-    // 人離開畫面就先不要丟水果，不然回來時已經扣光了
-    if (phase === 'playing') {
-      if (lastPose) lastPoseAt = now;
-      if (lastPoseAt && now - lastPoseAt > 1500) {
-        nextSpawn = Math.max(nextSpawn, now + 400);
-      }
-    }
+    // 沒人就整個停住 —— 不生水果、不跑物理、不判命中。
+    // 原本只延後生成，但已經在空中的水果照樣落下、照樣算漏接，
+    // 畫面上也沒有任何表示，看起來就像遊戲自己在玩。
+    // lastBladeAt 為 0 代表「從來沒看到過人」—— 那正是最該暫停的情況，
+    // 不是例外。原本寫 `&& !!lastBladeAt` 把語意弄反了，結果永遠不觸發。
+    lostPerson = phase === 'playing' && !demoMode
+                 && (now - lastBladeAt > NO_PERSON_MS);
 
     for (const side of SIDES) {
       trails[side] = trails[side].filter((p) => now - p.t <= TRAIL_MS);
@@ -1921,9 +1940,14 @@
     }
     for (const side of SIDES) strokeCache[side] = computeStroke(side);
 
-    if (phase === 'playing' && now >= nextSpawn) { spawn(); nextSpawn = now + spawnDelay(); }
-    stepFruits(dt);
-    if (!over) testSlices();
+    if (!lostPerson) {
+      if (phase === 'playing' && now >= nextSpawn) { spawn(); nextSpawn = now + spawnDelay(); }
+      stepFruits(dt);
+      if (!over) testSlices();
+    } else {
+      // 停住時只讓特效跑完，水果凍在原地等人回來
+      stepEffectsOnly(dt);
+    }
     stepHover(dt);
     draw(now);
 
@@ -2102,7 +2126,18 @@
     }
     drawHud(now);
 
-    if (paused) {
+    if (lostPerson) {
+      ctx.fillStyle = 'rgba(8,10,14,.6)'; ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = '700 26px -apple-system,"PingFang TC",sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('看不到你，先暫停', cv.width / 2, cv.height * 0.42);
+      ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';
+      ctx.fillStyle = '#9aa3b2';
+      ctx.fillText('回到畫面裡就會繼續，水果和分數都留著',
+                   cv.width / 2, cv.height * 0.42 + 30);
+      drawWhyNoArm(cv.height * 0.42 + 64);
+    } else if (paused) {
       ctx.fillStyle = 'rgba(8,10,14,.72)'; ctx.fillRect(0, 0, cv.width, cv.height);
       ctx.fillStyle = '#e6e8ec';
       ctx.font = '600 22px -apple-system,"PingFang TC",sans-serif';
@@ -2173,6 +2208,8 @@
     ui.side.textContent = stats.sideFix;
     ui.arm.textContent  = stats.armHidden;
     ui.chain.textContent = stats.chainBroken;
+    ui.state.textContent = lostPerson ? '沒看到人（暫停）'
+      : paused ? '分頁在背景' : demoMode ? phase + '（示範）' : phase;
     // 兩隻手各自的鏈現在成不成立，一眼看出是哪一邊有問題
     if (lastPose) {
       const kp = {};
@@ -2215,6 +2252,7 @@
     stats = freshStats(); fruits = []; bits = []; marks = []; pops = []; score = 0;
     lives = LIVES; over = false; ui.again.hidden = true; hoverBtns = [];
     freezeUntil = 0; doubleUntil = 0; comboN = 0;
+    lastBladeAt = 0; lostPerson = false;
     for (const f of fruits) if (f.stopFuse) f.stopFuse();
     phase = phase === 'idle' ? 'idle' : 'ready';
     strokeCache.left = null; strokeCache.right = null;
@@ -2273,6 +2311,7 @@
     }
     // 示範不需要相機，所以從 idle 也要能進 playing（只有結束畫面不打擾）
     if (phase !== 'over') phase = 'playing';
+    demoMode = true;
     syncHint();
     if (!running) { running = true; startLoops(); }
   });
@@ -2428,6 +2467,8 @@
     hoverBtns = [];
     ui.again.hidden = true;
     nextSpawn = performance.now() + 600;   // 給一點反應時間再丟第一顆
+    lastBladeAt = performance.now();       // 剛開始先當作有人，不要立刻判定離開
+    lostPerson = false; demoMode = false;
     setStatus('揮動手臂切水果，避開炸彈。');
   }
 
@@ -2608,7 +2649,7 @@
 
   document.addEventListener('visibilitychange', () => {
     paused = document.hidden;
-    if (!paused) { lastT = 0; lastFrameAt = 0; lastPoseAt = performance.now(); }
+    if (!paused) { lastT = 0; lastFrameAt = 0; lastBladeAt = performance.now(); }
   });
 
   best = loadBest();
