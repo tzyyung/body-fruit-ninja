@@ -102,8 +102,13 @@ git diff HEAD~1          # 或 HEAD~2、HEAD~3
 
 # ② 純邏輯單元測試（抽函式出來在 node 跑，不需要瀏覽器）
 #    適用：幾何、統計、狀態機、機率。寫成斷言，印出實際數字。
-python3 -c "<用 regex 從 app.js 抽函式>" > /tmp/t.js && node /tmp/t.js
+./mvp/menu.sh test
 ```
+
+測試放 `mvp/tests/*.test.js`，用 regex 從 `app.js` 抽出函式再 `eval`。
+這樣測的是**正在跑的那份程式**，不是一份會跟著漂走的複本。
+每修一個 bug 就補一條測試，測試名稱寫清楚它在擋什麼情境 ——
+不然同一個洞會再被挖開一次。
 
 ③ **瀏覽器載入**：零 console error。
 ④ **量版面**：`getBoundingClientRect()` 檢查有沒有被切掉、溢出、折行。

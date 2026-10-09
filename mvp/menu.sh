@@ -221,6 +221,18 @@ do_quantize() {
   python3 quantize.py "$src" "$dst"
 }
 
+do_test() {
+  local f fail=0
+  for f in tests/*.test.js; do
+    [ -f "$f" ] || { printf '  還沒有測試\n'; return 0; }
+    printf '%s%s%s\n' "$c_b" "${f##*/}" "$c_0"
+    if node "$f"; then :; else fail=1; fi
+  done
+  [ "$fail" = 0 ] && printf '\n%s全部通過%s\n' "$c_g" "$c_0" \
+                  || printf '\n%s有測試失敗%s\n' "$c_r" "$c_0"
+  return "$fail"
+}
+
 do_log() {
   [ -f "$LOG" ] && tail -40 "$LOG" || printf '還沒有紀錄：%s\n' "$LOG"
 }
@@ -235,6 +247,7 @@ menu() {
     printf '  %s3%s  停止伺服器\n'                   "$c_c" "$c_0"
     printf '  %s4%s  重新啟動\n'                     "$c_c" "$c_0"
     printf '  %s5%s  自我檢查（語法、CDN、模型）\n'  "$c_c" "$c_0"
+    printf '  %st%s  跑單元測試\n'                   "$c_c" "$c_0"
   printf '  %s8%s  下載模型到本機（開頁不用再等 CDN）\n' "$c_c" "$c_0"
   printf '  %s9%s  量化成 uint8（體積減半，會損失精度）\n'   "$c_c" "$c_0"
     printf '  %s6%s  看伺服器紀錄\n'                 "$c_c" "$c_0"
@@ -248,6 +261,7 @@ menu() {
       3) do_stop ;;
       4) do_stop; do_start ;;
       5) do_check ;;
+      t|T) do_test ;;
       8) do_models ;;
       9) do_quantize ;;
       6) do_log ;;
@@ -265,9 +279,10 @@ case "${1:-}" in
   open)   do_open ;;
   status) do_status ;;
   check)  do_check ;;
+  test)   do_test ;;
   models) do_models ;;
   quantize) do_quantize ;;
   log)    do_log ;;
   ''|menu) menu ;;
-  *) printf '用法：%s [start|stop|restart|open|status|check|log|models|quantize]\n' "$0"; exit 1 ;;
+  *) printf '用法：%s [start|stop|restart|open|status|check|test|log|models|quantize]\n' "$0"; exit 1 ;;
 esac

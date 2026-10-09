@@ -210,6 +210,11 @@
   // 會造成那一幀，刀會在揮到一半時消失。
   const track = { left: 0, right: 0 };
   const confirmed = { left: false, right: false };
+
+  // 這一幀為什麼沒有刀，是哪一關擋的。
+  // 畫面上三個關節分數全綠、卻看不到手掌時，使用者只能猜是自己站錯還是程式壞了 ——
+  // 而真正的原因（鏈沒確認、被另一手蓋掉）根本不在那三個數字裡。
+  const noBlade = { left: '', right: '' };
   const boneMed = {};           // 骨頭名 → 長度中位數用的樣本
   let stats = freshStats();
 
@@ -403,13 +408,55 @@
   //
   // 最強的訊號是肩膀：兩隻真手的手腕可以靠很近（雙手合十），
   // 但兩個肩膀永遠不會重疊。肩膀疊在一起就表示模型根本沒在分左右。
+  //
+  // 只拿「兩邊都過得了信心門檻」的點來比。
+  // 低於門檻的點根本做不出刀（bladeFor 會先擋掉），所以它偷不走任何東西；
+  // 讓一個 0.16 的猜測座標去否決一隻 0.60 的真手臂，是純粹的誤判。
+  // 而單手舉起時，模型本來就一定會替沒舉的那隻手吐出一組 0.1x 的猜測 ——
+  // 那正是這裡最常遇到的輸入，不是例外。
   function armsDistinct(kp) {
-    const sep = (a, b) => (a && b) ? Math.hypot(a.x - b.x, a.y - b.y) : Infinity;
     const scale = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
-    if (sep(kp.left_shoulder, kp.right_shoulder) < scale * 0.5) return false;
-    if (sep(kp.left_wrist, kp.right_wrist) < scale * 0.45) return false;
-    if (sep(kp.left_elbow, kp.right_elbow) < scale * 0.45) return false;
+    const sep = (part) => {
+      const need = part === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE;
+      const a = kp['left_' + part], b = kp['right_' + part];
+      if (!a || !b || a.score < need || b.score < need) return Infinity;
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    };
+    if (sep('shoulder') < scale * 0.5) return false;
+    // 手腕和手肘只擋「幾乎疊在同一點」。
+    // 雙手往中間揮、雙手合十，兩隻手腕本來就會靠得很近 ——
+    // 那是切水果最基本的動作，用肩膀那個門檻去擋等於每次都砍掉一把刀。
+    if (sep('wrist') < scale * 0.15) return false;
+    if (sep('elbow') < scale * 0.15) return false;
     return true;
+  }
+
+  // 兩條鏈重疊時，手腕信心要差這麼多倍才算「一眼就看得出誰是真的」。
+  // 1.25 來自實際分布：舉起的手大約 0.4–0.8，沒舉的那隻猜測值大約 0.1–0.25，
+  // 中間隔了兩倍以上；相差不到 1.25 倍就表示兩邊都說不準，再去比軌跡信用。
+  const LR_SCORE_MARGIN = 1.25;
+
+  // 兩條鏈重疊時要刪掉哪一邊。
+  //
+  // 先比手腕信心，信心相近才比軌跡信用 —— 順序不能反過來。
+  // 重疊的時候幽靈那條是「用真手的點拼出來的」：它的骨鏈成立、
+  // 也接得上上一幀（跟的是同一個真實動作），所以軌跡信用賺得跟真手一樣快，
+  // 那個數字在這裡根本不是獨立證據。
+  //
+  // 反過來比會卡死：幽靈先確認、真手剛舉起還在爬，真手每幀都被判成弱的、
+  // 被刪掉、信用再被扣 —— 永遠翻不了身。症狀是「手掌不見了而且一直不回來」。
+  //
+  // 手腕信心是唯一不受重疊汙染的量：模型對沒舉起的那隻手只能猜，
+  // 猜出來的分數就是低。
+  function weakerArm(kp, trk2) {
+    const sl = (kp.left_wrist  && kp.left_wrist.score)  || 0;
+    const sr = (kp.right_wrist && kp.right_wrist.score) || 0;
+    const hi = Math.max(sl, sr), lo = Math.min(sl, sr);
+    if (hi > lo * LR_SCORE_MARGIN) return sl >= sr ? 'right' : 'left';
+    if (Math.abs(trk2.left - trk2.right) > 0.01) {
+      return trk2.left > trk2.right ? 'right' : 'left';
+    }
+    return sl >= sr ? 'right' : 'left';
   }
 
   // 這一側的三個關節，跟它自己上一次被信任的位置有多接近。
@@ -507,7 +554,11 @@
   // 這裡只是提早退出，省掉後面的計算。
   function armVisible(side, kp) {
     const w = kp[side + '_wrist'];
-    if (!w || w.score < MIN_SCORE) { stats.armHidden++; return false; }
+    if (!w || w.score < MIN_SCORE) {
+      stats.armHidden++;
+      noBlade[side] = '手腕看不清楚 —— 手舉高一點';
+      return false;
+    }
     return true;
   }
 
@@ -520,7 +571,7 @@
       return k && k.score >= need ? mirror(k) : null;
     };
     const wrist = get('wrist');
-    if (!wrist) return null;
+    if (!wrist) { noBlade[side] = '手腕看不清楚 —— 手舉高一點'; return null; }
 
     const mode = ui.bladeSel.value;
     if (mode === 'palm' || mode === 'tip') {
@@ -567,6 +618,9 @@
       // 一隻手就長出兩把刀。位置錯的刀比沒有刀糟得多：
       // 會誤砍炸彈、斷連擊、讓整個遊戲看起來是隨機的。
       stats.chainBroken++;
+      noBlade[side] = !eb ? '看不到手肘 —— 手肘也要進畫面'
+                    : !sh ? '看不到肩膀 —— 退後一點讓上半身入鏡'
+                    : '手停一下，馬上就好';
       return null;
     }
     if (mode === 'wrist') {
@@ -1152,10 +1206,20 @@
       x += 14;
     }
     ctx.textAlign = 'center';
-    ctx.fillStyle = '#9aa3b2';
-    ctx.fillText('門檻 ' + MIN_SCORE.toFixed(2)
-      + '　只有手腕是必要的，手肘／肩膀只影響準度',
-      cv.width / 2, y + 18);
+    // 分數都過了卻還是沒有刀，表示是後面的關卡擋的。
+    // 不講出是哪一關，使用者看到三個綠色數字只會以為程式壞了。
+    // 一手一行 —— 兩行併一行最長會到 38 個全形字，640 寬的畫布塞不下。
+    const why = SIDES
+      .filter((sd) => noBlade[sd])
+      .map((sd) => (sd === 'left' ? '左手' : '右手') + '　' + noBlade[sd]);
+    if (why.length) {
+      ctx.fillStyle = '#fbbf24';
+      why.forEach((line, i) => ctx.fillText(line, cv.width / 2, y + 18 + i * 17));
+    } else {
+      ctx.fillStyle = '#9aa3b2';
+      ctx.fillText('肩膀、手肘、手腕三點都要進畫面，掌刀才算得出來',
+                   cv.width / 2, y + 18);
+    }
   }
 
   // 把模型輸出的 17 個點原封不動畫出來 —— 不過門檻、不經穩定化。
@@ -1747,6 +1811,7 @@
     // 不然掌刀是從抓錯的手肘算出來的，怎麼平滑都沒用。
     stabilize(kp, now);
     feedCalib(kp);
+    noBlade.left = ''; noBlade.right = '';
 
     // 先決定哪幾隻手臂可用，再去算刀刃。
     // 兩邊的點重疊時，弱的那一邊直接從 kp 裡拿掉 ——
@@ -1755,18 +1820,14 @@
     updateTracks(kp, now);
 
     if (!armsDistinct(kp)) {
-      // 信用高的留下。信用相同才比手腕分數。
-      let weak;
-      if (Math.abs(track.left - track.right) > 0.01) {
-        weak = track.left > track.right ? 'right' : 'left';
-      } else {
-        const sl = (kp.left_wrist  && kp.left_wrist.score)  || 0;
-        const sr = (kp.right_wrist && kp.right_wrist.score) || 0;
-        weak = sl >= sr ? 'right' : 'left';
-      }
+      const weak = weakerArm(kp, track);
       for (const part of ARM) delete kp[weak + '_' + part];
       chainHist[weak] = null;
-      track[weak] = SPRT_B; confirmed[weak] = false;
+      // 只扣分，不打到下界。打到下界等於「這一幀判錯就鎖死好幾秒」，
+      // 而重疊本來就常常是一兩幀的事。扣的量跟「三點湊不齊」同一個標準。
+      track[weak] = Math.max(SPRT_B, track[weak] - 2);
+      confirmed[weak] = false;
+      noBlade[weak] = '兩隻手的關節疊在一起 —— 手分開一點';
       stats.lrRejects++;
     }
 
@@ -1788,7 +1849,8 @@
         const sr = (kp.right_wrist && kp.right_wrist.score) || 0;
         // 到這裡兩邊都是鏈成立的刀（鏈不成立的在 bladeFor 就被擋掉了），
         // 所以比手腕分數就好
-        if (sl >= sr) blades.right = null; else blades.left = null;
+        if (sl >= sr) { blades.right = null; noBlade.right = '兩把掌刀太近 —— 手分開一點'; }
+        else          { blades.left  = null; noBlade.left  = '兩把掌刀太近 —— 手分開一點'; }
         stats.lrRejects++;
       }
     }
