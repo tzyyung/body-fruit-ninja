@@ -28,6 +28,22 @@
     // 實測截圖裡兩把刀相距 90px，舊門檻 10px 完全擋不到。
     lrMin:     0.11,
     fruitR:    0.053,
+    // 炸彈的判定半徑另外訂，而且比水果小。
+    //
+    // 水果判定寬鬆是刻意的 —— 體感追蹤本來就會抖，容錯對玩家有利，
+    // 「差一點也切到」不會讓人生氣。但炸彈會扣命，寬鬆就變成
+    // 「明明避開了還是被炸到」，那是在處罰系統自己的誤差。
+    //
+    // 在真瀏覽器裡量過 emoji 字形的不透明像素（從中心射 36 個方位）：
+    //   字級 61.1px（= px(fruitR) × 1.8）
+    //   💣 看得見的半徑 中位 29.0px（最小 23.5、最大 36.5）
+    //   🍉 中位 26.0px
+    // 而判定是 px(fruitR) + px(PALM_PAD) = 33.9 + 7.7 = 41.6px
+    //   → 炸彈有 12.6px 的隱形致命環，命中面積是看得見的 2.06 倍。
+    //
+    // 訂成 R + pad = 29.0（看得見的中位）→ R = 21.3 → 0.0333 畫面寬。
+    // 「看到什麼就是什麼」，而且畫面上會把這個邊界畫出來（見 drawFruits）。
+    bombR:     0.0333,
   };
   const px = (frac) => frac * cv.width;
 
@@ -2096,7 +2112,7 @@
       ch: kind.ch, color: kind.color,
       bomb: !!bomb, treasure: treasure || null,
       dead: false, rot: 0, spin: (Math.random() - 0.5) * 4 * slow,
-      cuts: [], gen: 0, R: px(F.fruitR), slow,
+      cuts: [], gen: 0, R: px(bomb ? F.bombR : F.fruitR), slow,
       // 引信聲要跟著拉長，不然聲音先停了炸彈還在飛
       stopFuse: bomb ? startFuse(2.2 / slow) : null,
     });
@@ -2613,6 +2629,23 @@
       }
       ctx.fillText(f.ch, 0, 0);
       ctx.restore();
+
+      // 炸彈把判定邊界畫出來。
+      //
+      // 這是唯一會扣命的東西，所以「碰到哪裡會爆」不能靠猜。
+      // emoji 的輪廓是不規則的（💣 各方位 23.5–36.5px），
+      // 玩家沒辦法從圖案推出判定圓在哪 —— 畫出來就沒有爭議了。
+      // 半徑用 f.R + pad，跟 testSlices 用的同一個值（見 F.bombR 的註解）。
+      if (f.bomb) {
+        const pulse = 0.55 + 0.25 * Math.sin(now / 150);
+        ctx.strokeStyle = 'rgba(248,113,113,' + pulse.toFixed(2) + ')';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.arc(f.x, f.y, f.R + px(PALM_PAD), 0, 6.3);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
     }
 
     // 果汁
