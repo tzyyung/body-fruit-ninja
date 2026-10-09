@@ -565,6 +565,47 @@ tfjs 預設從 `tfhub.dev` 抓模型，而那會重導到 Kaggle 拿簽章網址
 量過了，不值得：權重是高熵資料，gzip 只壓掉 8%（17.1MB → 15.9MB）。
 而且從 localhost 讀本來就只要 4ms。
 
+### 5.3b 「縮圖再推論」沒有用，而且是結構上不可能有用
+
+面板上有個「縮圖再推論」的選項（先把影格畫到 256 寬的畫布再送進模型）。
+Android 實測：打勾與不打勾都是 **10 次/秒**，完全沒差。
+
+原因在模型自己的簽章裡：
+
+```
+movenet-lightning  input:0  DT_INT32  [1, 192, 192, 3]
+movenet-thunder    input:0  DT_INT32  [1, 256, 256, 3]
+```
+
+**輸入尺寸是固定的**，`pose-detection` 不管餵什麼都先 `resizeBilinear`
+到那個尺寸。所以這個選項只是把縮圖的工作從 tfjs 的 GPU resize 換成
+我自己的 CPU `drawImage`，推論本身一點都沒變 —— 甚至多一次
+CPU→GPU 的來回。
+
+選項留著當對照組，但名字改成「縮圖再推論（量過沒用）」。
+**量過而沒用的東西要寫下來**，不然下一個人會再花一輪去試。
+
+### 5.3c 畫布尺度一變，所有用像素存的狀態都作廢
+
+高解析看門狗（幀率連續 3 秒低於 45 就把 `renderScale` 降回 1）會改變
+`cv.width/height`。關節點是乘過 `renderScale` 才進系統的，所以尺度一降，
+新的點就小 1.53 倍 —— 但 `calib.forearm` 還是舊尺度那一份，而且
+`trk.forearm` 鎖定（`settled`）之後**不會自己改回來**。
+
+後果：揮擊門檻永遠維持 1.53 倍嚴，從那一刻起怎麼揮都不算一刀，
+而且畫面上完全看不出原因。同一個事件還讓懸停圓圈「消失」——
+圓圈原本存的是絕對像素，尺度一變就留在舊尺寸算出來的位置上
+（Android 實測：WebGPU 不會、WebGL 會，差別就在幀率有沒有跨過
+看門狗那條 45fps 的線）。
+
+兩個做法：
+1. 圓圈改用**比例**存，`btnAt()` 在用的時候才換算成這一幀的像素 ——
+   畫、判命中、滑鼠點都走同一個入口。
+2. `sizeCanvas()` 偵測到尺度真的變了就呼叫 `onScaleChange()`，
+   把校正、骨長中位數、關節歷史、軌跡、統計整批清掉。
+
+→ 一般化的規則：**任何跨越「尺度可能改變」的持久狀態都不能用像素存。**
+
 ### 5.4 畫布解析度：量過才決定
 
 畫布內部尺寸原本 = 相機解析度。視訊被放大是沒辦法的事（相機就那個解析度），
@@ -707,7 +748,7 @@ app.js              全部的程式（約 3200 行）
 models/             MoveNet 權重三組（lightning / lightning-uint8 / thunder）
 menu.sh             start/stop/open/check/test/pwlog/models/quantize
 quantize.py         float16 → uint8 再量化（自己寫的，見 5.2）
-tests/              純邏輯單元測試（11 檔 176 條）
+tests/              純邏輯單元測試（13 檔 211 條）
 tests/gestures.js   動作語料產生器
 tests/bdd.js        零相依的 Gherkin 執行器（繁中關鍵字）
 features/           驗收條件（Gherkin）

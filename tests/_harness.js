@@ -32,8 +32,11 @@ function fn(name) {
 // const 在 eval 裡又是 eval 自己的區塊作用域，所以不能直接照搬 fn() 的寫法，
 // 要取右手邊的運算式。用法：const llr = eval(H.expr('llr'));
 function expr(name) {
-  const re = new RegExp('  const ' + name + ' = ([\\s\\S]*?\\n  \\};)');
-  const m = src.match(re);
+  // 一行就寫完的先試 —— 多行那條 regex 會一路吃到下一個 `\n  };`，
+  // 抽出來是一段語法壞掉的東西，錯誤訊息完全看不出是這個原因（踩過：btnAt）。
+  const one = src.match(new RegExp('\\n  const ' + name + ' = (.*);\\n'));
+  if (one) return '(' + one[1] + ')';
+  const m = src.match(new RegExp('  const ' + name + ' = ([\\s\\S]*?\\n  \\};)'));
   if (!m) die('抽不到運算式 ' + name);
   return '(' + m[1].replace(/;\s*$/, '') + ')';
 }

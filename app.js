@@ -1449,8 +1449,28 @@
   const HIDPI_BAD_MS = 3000;
   let hidpiBadSince = 0;
 
+  // 畫布尺度一變，所有「用像素存的」就整批作廢。
+  //
+  // 關節點是乘過 renderScale 才進系統的（inferLoop 的 kScale），
+  // 所以尺度從 1.53 降回 1 之後，新的點小 1.53 倍 —— 但 calib.forearm
+  // 還是舊尺度那一份，而且 trk.forearm 鎖定（settled）之後不會自己改回來。
+  // 後果是揮擊門檻永遠維持 1.53 倍嚴，從那一刻起怎麼揮都不算一刀，
+  // 而且畫面上完全看不出原因。
+  // 骨長中位數、關節歷史、軌跡同理，全部是像素。
+  function onScaleChange() {
+    resetCalib();
+    for (const k of Object.keys(joint)) delete joint[k];
+    for (const k of Object.keys(boneMed)) delete boneMed[k];
+    for (const side of SIDES) {
+      trails[side] = []; bases[side] = []; prev[side] = null;
+      strokeCache[side] = null;
+    }
+    stats = freshStats();
+  }
+
   function sizeCanvas() {
     if (!video.videoWidth) return;
+    const was = renderScale;
     const want = ui.hidpi && ui.hidpi.checked
       ? Math.min(HIDPI_MAX, Math.max(1, (cv.clientWidth * (window.devicePixelRatio || 1))
                                         / video.videoWidth))
@@ -1459,6 +1479,7 @@
     cv.width  = Math.round(video.videoWidth  * renderScale);
     cv.height = Math.round(video.videoHeight * renderScale);
     cv.parentElement.style.setProperty('--ar', (cv.width / cv.height).toFixed(4));
+    if (renderScale !== was) onScaleChange();
   }
 
   // ── 量測面板的收合 ────────────────────────────────────────────────
@@ -1500,15 +1521,14 @@
     if (now - hidpiBadSince < HIDPI_BAD_MS) return;
     hidpiBadSince = 0;
     ui.hidpi.checked = false;
-    sizeCanvas();
-    stats = freshStats();
+    sizeCanvas();   // 尺度變了的話 onScaleChange 會把像素存的東西全部清掉
     setStatus('畫面跟不上，已經改回標準解析度。');
   }
 
   if (ui.hidpi) ui.hidpi.addEventListener('change', () => {
+    // 尺度真的變了的話 onScaleChange 會歸零統計與所有像素狀態 ——
+    // 不然「畫面更新」是兩種設定混在一起的平均值，量不準
     sizeCanvas();
-    // 統計要歸零 —— 不然「畫面更新」是兩種設定混在一起的平均值，量不準
-    stats = freshStats();
     setStatus('畫布解析度 ×' + renderScale.toFixed(2)
       + '（' + cv.width + '×' + cv.height + '），數字已歸零。');
   });
@@ -1851,6 +1871,15 @@
   // 而且瀏覽器規定相機權限與 AudioContext 都要由真實點擊觸發。
   const DWELL_MS = 2000;    // 要停多久才算按下
   const DWELL_DECAY = 2.5;  // 手離開後進度倒退的速度（倍率）
+  // 懸停圓圈用**比例**存，不要存像素。
+  // 畫布尺寸在遊戲中會變：高解析看門狗（fps 連續 3 秒 < 45 就把
+  // renderScale 降回 1）、轉向、手機網址列收起來。存像素的話圓圈會留在
+  // 舊尺寸算出來的位置上 —— Android 實測「出現圓圈但很快就又消失了」，
+  // 而且 WebGPU 不會、WebGL 會，差別就在幀率有沒有跨過看門狗那條線。
+  //
+  // 畫、判命中、滑鼠點都走這一個入口，不要各算各的。
+  const btnAt = (b) => ({ x: px(b.rx), y: py(b.ry), r: px(b.rr) });
+
   let hoverBtns = [];
 
   function hoverPoints() {
@@ -1865,7 +1894,8 @@
   function stepHover(dt) {
     const pts = hoverPoints();
     for (const b of hoverBtns) {
-      const on = pts.some((p) => dist(p, b) <= b.r);
+      const box = btnAt(b);
+      const on = pts.some((p) => dist(p, box) <= box.r);
       const was = b.dwell;
       b.dwell = on
         ? Math.min(1, b.dwell + dt * 1000 / DWELL_MS)
@@ -1891,7 +1921,8 @@
     const x = (ev.clientX - r.left) * (cv.width / r.width);
     const y = (ev.clientY - r.top) * (cv.height / r.height);
     for (const b of hoverBtns) {
-      if (Math.hypot(x - b.x, y - b.y) <= b.r) {
+      const box = btnAt(b);
+      if (Math.hypot(x - box.x, y - box.y) <= box.r) {
         initAudio();
         sfx('confirm');
         const fn = b.action;
@@ -2142,17 +2173,18 @@
 
   function drawHoverBtns() {
     for (const b of hoverBtns) {
+      const box = btnAt(b);
       ctx.save();
-      ctx.translate(b.x, b.y);
+      ctx.translate(box.x, box.y);
       const hot = b.dwell > 0;
-      ctx.beginPath(); ctx.arc(0, 0, b.r, 0, TAU);
+      ctx.beginPath(); ctx.arc(0, 0, box.r, 0, TAU);
       ctx.fillStyle = hot ? 'rgba(24,36,56,.9)' : 'rgba(16,20,28,.82)'; ctx.fill();
       ctx.lineWidth = 4;
       ctx.strokeStyle = hot ? 'rgba(96,165,250,.45)' : 'rgba(255,255,255,.22)';
       ctx.stroke();
       if (b.dwell > 0) {
         ctx.beginPath();
-        ctx.arc(0, 0, b.r, -Math.PI / 2, -Math.PI / 2 + b.dwell * Math.PI * 2);
+        ctx.arc(0, 0, box.r, -Math.PI / 2, -Math.PI / 2 + b.dwell * Math.PI * 2);
         ctx.lineWidth = 6; ctx.strokeStyle = '#60a5fa'; ctx.lineCap = 'round';
         ctx.stroke();
       }
@@ -2714,8 +2746,7 @@
 
   // 把一次推論結果吃進軌跡裡
   function showStartBtn() {
-    hoverBtns = [{ x: px(0.5), y: py(0.58),
-                   r: px(0.12),
+    hoverBtns = [{ rx: 0.5, ry: 0.58, rr: 0.12,
                    label: '開始', dwell: 0, action: beginPlay }];
   }
 
@@ -3571,7 +3602,7 @@
     phase = 'over';
     syncHint();
     ui.again.hidden = false;
-    hoverBtns = [{ x: px(0.5), y: py(0.62), r: px(0.119),
+    hoverBtns = [{ rx: 0.5, ry: 0.62, rr: 0.119,
                    label: '再玩一次', dwell: 0, action: restart }];
     setStatus('把手停在圓圈上，圈走完一輪就重新開始。');
   }

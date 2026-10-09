@@ -127,6 +127,10 @@ for (const [gate, caller] of [
   ['sweepOf',       'computeStroke'],  // 揮擊量
   ['segments',      'sweepLen'],       // 分段
   ['liftChain',     'palm3D'],         // Taylor 逐段還原
+  ['onScaleChange', 'sizeCanvas'],     // 尺度變了，像素存的東西要作廢
+  ['resetCalib',    'onScaleChange'],  // 校正值是像素，首當其衝
+  ['btnAt',         'stepHover'],      // 命中判定要用這一幀的尺寸
+  ['btnAt',         'drawHoverBtns'],  // 畫的也是
 ]) {
   t(caller + '() 裡有呼叫 ' + gate + '()',
     body(caller).includes(gate + '('), true);
@@ -192,6 +196,24 @@ t('warmup 的內文不碰全域 detector', /\bdetector\b/.test(body('warmup')), 
 t('drawReady 不拿 detector 當有沒有圓圈的依據',
   /\bdetector\b/.test(body('drawReady')), false);
 t('drawReady 問的是 hoverBtns', /hoverBtns/.test(body('drawReady')), true);
+
+section('懸停圓圈用比例存，不要存像素');
+
+// 2026-10-09 Android 回報「出現圓圈但很快就又消失了」，WebGPU 不會、
+// WebGL 會 —— 差別在幀率有沒有跨過高解析看門狗那條線（fps 連續 3 秒
+// < 45 就把 renderScale 降回 1、重設 cv.width/height）。
+// 圓圈存絕對像素的話，就留在舊尺寸算出來的位置上。
+// 接線檢查是比對字串，所以 `if (false) onScaleChange();` 照樣會過 ——
+// 跑變異時實際踩到。守衛本身也要鎖，不能只鎖「有沒有提到這個名字」。
+t('尺度改變的守衛比的是前後值',
+  /if \(renderScale !== was\) onScaleChange\(\);/.test(code), true);
+
+t('btnAt 只有一個定義', count('const btnAt ='), 1);
+t('建立圓圈時不寫入 x/y/r 像素',
+  (code.match(/hoverBtns = \[\{ x:/g) || []).length, 0);
+t('建立圓圈用的是比例', (code.match(/hoverBtns = \[\{ rx:/g) || []).length, 2);
+// 滑鼠點的那條路也要走同一個圓，不能自己算一份
+t('滑鼠點擊走 btnAt', /const box = btnAt\(b\);\n      if \(Math\.hypot/.test(code), true);
 
 section('模型檔同時抓，不要排隊');
 
