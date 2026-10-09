@@ -79,6 +79,30 @@ t('「持續多久」只有一份實作', count('function heldFor('), 1);
 t('沒有人自己記 heldSince（要走 heldFor）',
   count('heldSince') - count('const heldSince') - count('heldSince[key]') * 1, 0);
 
+section('用到 now 的函式一定要有 now');
+
+// 2026-10-09 踩過：把 stepFruits 裡的 performance.now() 統一成一個 now 時，
+// 字串取代連隔壁的 stepEffectsOnly 一起改了，但那支沒有 now ——
+// ReferenceError 直接殺掉整條 requestAnimationFrame 鏈，畫面定格。
+// 語法檢查抓不到（它是合法的識別字），只有真的跑起來才會炸。
+{
+  const bad = [];
+  const re = /\n  function (\w+)\(([^)]*)\) \{([\s\S]*?)\n  \}/g;
+  let m;
+  while ((m = re.exec(code))) {
+    const [, name, args, body] = m;
+    // performance.now() / Date.now() 裡的 now 不算，要先拿掉
+    const b2 = body.replace(/\b(performance|Date)\.now\b/g, 'TIMEFN');
+    if (!/\bnow\b/.test(b2)) continue;
+    const hasParam = /\bnow\b/.test(args);
+    const hasLocal = /\b(const|let|var)\s+now\b/.test(b2);
+    // 巢狀函式自己帶 now 參數的也算（例如 (now) => …）
+    const nested = /\(\s*now\s*[,)]/.test(b2);
+    if (!hasParam && !hasLocal && !nested) bad.push(name);
+  }
+  t('沒有函式用到未定義的 now', bad.length ? bad.join('、') : 0, 0);
+}
+
 section('接線：每一道關卡都要真的被呼叫');
 
 // 「測得到函式」不等於「函式有被接上」。

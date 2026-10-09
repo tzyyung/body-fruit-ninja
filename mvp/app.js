@@ -187,7 +187,7 @@
     combo:el('m-combo'), crit:el('m-crit'), lr:el('m-lr'),
     jump:el('m-jump'), bone:el('m-bone'), side:el('m-side'), arm:el('m-arm'),
     chain:el('m-chain'), chain2:el('m-chain2'), state:el('m-state'),
-    panelBtn:el('btn-panel'),
+    panelBtn:el('btn-panel'), hidpi:el('chk-hidpi'),
     track:el('m-track'),
     link:el('m-link'), rejMove:el('m-rej-move'), rejTime:el('m-rej-time'),
     rejRange:el('m-rej-range'), gapAvg:el('m-gapavg'), lin:el('m-lin'),
@@ -344,7 +344,7 @@
     if (!video.videoWidth) {
       await new Promise((r) => video.addEventListener('loadedmetadata', r, { once:true }));
     }
-    cv.width = video.videoWidth; cv.height = video.videoHeight;
+    sizeCanvas();
     // 版面要知道長寬比才能同時約束寬與高（見 index.html 的 .stage）。
     // 相機可能給 4:3 也可能給 16:9，不能寫死。
     cv.parentElement.style.setProperty('--ar', (cv.width / cv.height).toFixed(4));
@@ -1208,6 +1208,45 @@
 
   const autoScore = () => ui.scoreSel.value === 'auto';
 
+  // ── 畫布解析度 ────────────────────────────────────────────────────
+  //
+  // 畫布內部尺寸預設 = 相機解析度。視訊被放大到版面寬度是沒辦法的事
+  // （相機就那個解析度），但**我們自己畫上去的東西**不該跟著糊：
+  // 實測桌機上 640 的畫布被顯示成 1077 裝置像素，放大 1.68 倍，
+  // 文字、刀痕、炸彈的虛線圈全部是糊的。
+  //
+  // 遊戲引擎（Phaser 的 Scale Manager）的做法是把 backing store 設成
+  // 「顯示尺寸 × devicePixelRatio」。代價是填充率：DPR=3 的手機上
+  // 像素量變 9 倍，而這個遊戲同時還在跑 30fps 的推論。
+  // 所以做成開關去量，不要憑感覺決定（面板的「畫面更新」就是答案）。
+  //
+  // 座標系：關節點是在相機解析度下的座標，畫布放大之後要跟著乘 ——
+  // 乘在 inferLoop 收到關節點的那一個地方，下游完全不用改。
+  let renderScale = 1;
+
+  // 上限 2×。實測 M4 上 ×2.96（像素量 8.76 倍）畫面只從 61 掉到 60fps，
+  // 但那是桌機；手機沒量過，而 2× 已經拿到大部分的清晰度（4 倍像素量
+  // 而不是 8.8 倍）。真的不夠用再往上調，並且重量一次。
+  const HIDPI_MAX = 2;
+  // 開著高解析但幀率撐不住就自動退回。手機的效能沒量過，
+  // 與其猜一個「哪些裝置可以」的名單（那是 UA 嗅探，會過時），
+  // 不如讓它自己量 —— 這個專案到處都是這個模式。
+  const HIDPI_MIN_FPS = 45;
+  const HIDPI_BAD_MS = 3000;
+  let hidpiBadSince = 0;
+
+  function sizeCanvas() {
+    if (!video.videoWidth) return;
+    const want = ui.hidpi && ui.hidpi.checked
+      ? Math.min(HIDPI_MAX, Math.max(1, (cv.clientWidth * (window.devicePixelRatio || 1))
+                                        / video.videoWidth))
+      : 1;
+    renderScale = Math.round(want * 100) / 100;
+    cv.width  = Math.round(video.videoWidth  * renderScale);
+    cv.height = Math.round(video.videoHeight * renderScale);
+    cv.parentElement.style.setProperty('--ar', (cv.width / cv.height).toFixed(4));
+  }
+
   // ── 量測面板的收合 ────────────────────────────────────────────────
   //
   // 面板是給開發者看的儀器，玩的時候只會佔畫面。窄螢幕（手機、平板直式）
@@ -1231,6 +1270,27 @@
     ui.panelBtn.textContent = show ? '收起量測' : '量測';
     try { localStorage.setItem(PANEL_KEY, show ? '1' : '0'); } catch (e) { /* 無痕視窗會丟錯 */ }
   }
+
+  // 幀率撐不住就自動退回 1×。只在高解析開著的時候看。
+  function hidpiWatchdog(now, fps) {
+    if (renderScale <= 1 || !ui.hidpi || !ui.hidpi.checked) { hidpiBadSince = 0; return; }
+    if (fps >= HIDPI_MIN_FPS) { hidpiBadSince = 0; return; }
+    if (!hidpiBadSince) { hidpiBadSince = now; return; }
+    if (now - hidpiBadSince < HIDPI_BAD_MS) return;
+    hidpiBadSince = 0;
+    ui.hidpi.checked = false;
+    sizeCanvas();
+    stats = freshStats();
+    setStatus('畫面跟不上，已經改回標準解析度。');
+  }
+
+  if (ui.hidpi) ui.hidpi.addEventListener('change', () => {
+    sizeCanvas();
+    // 統計要歸零 —— 不然「畫面更新」是兩種設定混在一起的平均值，量不準
+    stats = freshStats();
+    setStatus('畫布解析度 ×' + renderScale.toFixed(2)
+      + '（' + cv.width + '×' + cv.height + '），數字已歸零。');
+  });
 
   (function initPanel() {
     let saved = null;
@@ -2248,6 +2308,7 @@
   // 沒人的時候水果凍住，但果汁、閃光這些殘留特效要讓它們播完，
   // 不然畫面會卡著一堆半透明的東西
   function stepEffectsOnly(dt) {
+    const now = performance.now();
     const g = py(GRAVITY_F);
     bits = bits.filter((b) => {
       b.vy += g * dt; b.x += b.vx * dt; b.y += b.vy * dt;
@@ -2605,8 +2666,11 @@
       try {
         poses = await detector.estimatePoses(inp.src, { flipHorizontal: false });
         // 縮過圖的話，關節點座標是在縮圖的尺度上，要放大回原本的畫面
-        if (inp.scale !== 1 && poses[0]) {
-          for (const k of poses[0].keypoints) { k.x *= inp.scale; k.y *= inp.scale; }
+        // 兩個尺度一次乘完：縮圖推論的還原 × 畫布的高解析倍率。
+        // 這是關節點進入系統的唯一入口，乘在這裡下游就完全不用知道。
+        const kScale = inp.scale * renderScale;
+        if (kScale !== 1 && poses[0]) {
+          for (const k of poses[0].keypoints) { k.x *= kScale; k.y *= kScale; }
         }
       } catch (e) { setStatus('推論失敗：' + e.message, true); }
       const now = performance.now();
@@ -2931,6 +2995,8 @@
 
   function updatePanel() {
     const fps = stats.fpsTimes.length;
+    // 幀率的唯一來源就在這裡，看門狗也接在這 —— 不要另外再數一次
+    hidpiWatchdog(performance.now(), fps);
     ui.fps.textContent = fps + ' /秒';
     tint(ui.fps, -fps, -30, -20);
     // 這兩個數字現在是獨立的。解耦生效的話，推論掉下去畫面仍該維持住。
