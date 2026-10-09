@@ -156,34 +156,166 @@
   // 要刀刃就只能從前臂方向外推：手長約前臂的 0.7，掌緣中段取 0.55。
   const EXTRAP_K = 0.55;
 
+  // dir/files/race/bytes 是給「先下載、邊下載邊回報進度」用的：
+  //   files  要抓哪些（tfjs 等一下會抓同樣這幾個，從快取讀）
+  //   race   最大的那一個，拿它比各來源的吞吐量（為什麼見下面）
+  //   bytes  全部加起來幾位元組 —— 進度的分母，沒有它只能轉圈圈
+  // 檔名與大小對不對由 ./menu.sh check 比對磁碟上的實際檔案。
   const MODELS = {
     'blazepose-lite':    { kind: 'blazepose', modelType: 'lite' },
     'blazepose-full':    { kind: 'blazepose', modelType: 'full' },
     'movenet-lightning': { kind: 'movenet',   modelType: 'SINGLEPOSE_LIGHTNING',
-                           local: 'models/movenet-lightning/model.json' },
+      dir: 'models/movenet-lightning', bytes: 4818229,
+      files: ['model.json', 'group1-shard1of2.bin', 'group1-shard2of2.bin'],
+      race: 'group1-shard1of2.bin' },
     'movenet-lightning-uint8': { kind: 'movenet', modelType: 'SINGLEPOSE_LIGHTNING',
-                           local: 'models/movenet-lightning-uint8/model.json' },
+      dir: 'models/movenet-lightning-uint8', bytes: 2500414,
+      files: ['model.json', 'group1-shard1of1.bin'],
+      race: 'group1-shard1of1.bin' },
     'movenet-thunder':   { kind: 'movenet',   modelType: 'SINGLEPOSE_THUNDER',
-                           local: 'models/movenet-thunder/model.json' },
+      dir: 'models/movenet-thunder', bytes: 12645263,
+      files: ['model.json', 'group1-shard1of3.bin', 'group1-shard2of3.bin',
+              'group1-shard3of3.bin'],
+      race: 'group1-shard1of3.bin' },
   };
 
-  // 模型預設是從 tfhub.dev 抓，而那會重導到 Kaggle 拿簽章網址 ——
-  // 實測 model.json 加兩個權重分片要 7.4 秒，使用者就是在那裡乾等。
-  // 同樣三個檔從 localhost 讀只要 4 毫秒。
-  // 本機沒有就回去用 CDN，所以 ./menu.sh models 沒跑過也不會壞。
-  const localModel = new Map();
-  async function localModelUrl(key) {
-    if (localModel.has(key)) return localModel.get(key);
-    const u = MODELS[key] && MODELS[key].local;
-    let found = null;
-    if (u) {
-      try {
-        const r = await fetch(u, { method: 'HEAD' });
-        if (r.ok) found = u;
-      } catch (e) { /* 沒有就算了，回去用 CDN */ }
+  // ---- 模型要從哪裡抓 ------------------------------------------------------
+  //
+  // 同一份 3.8MB 權重分片，2026-10-09 實測：
+  //
+  //   | 來源          | 總時間 | 吞吐      | TTFB  |
+  //   | localhost     | 4 ms   | —         | —     |
+  //   | jsDelivr(gh)  | 2.96 s | 1385 KB/s | 0.50s |
+  //   | GitHub Pages  | 89.4 s |   43 KB/s | 1.45s |
+  //   | tfhub→Kaggle  | 7.4 s（還要走兩次重導）    |
+  //
+  // 所以來源要比，不能寫死 —— 寫死 CDN 的話本機開發從 4ms 變成上網抓。
+  // 但**比什麼**很講究，兩種直覺都會選錯：
+  //
+  //   比誰先回應 → Pages 的 TTFB 1.45s 比 jsDelivr 2.42s 快，
+  //                 會選到吞吐量慢 30 倍的那個。
+  //   拿小檔比   → 用 model.json（168KB）當樣本時，jsDelivr 因為邊緣
+  //                 還沒熱，TTFB 7.1 秒輸掉；但同一時間它抓 4MB 只花
+  //                 2.96 秒。小檔量到的是冷啟，不是吞吐量。
+  //
+  // 唯一不會騙人的是**直接賽那個最大的檔，比誰先抓完**。
+
+  // 從 GitHub Pages 的網址反推 jsDelivr 的 gh 來源，fork 出去的人不用改程式。
+  //   https://<人>.github.io/<倉庫>/…  →  cdn.jsdelivr.net/gh/<人>/<倉庫>@main/
+  //   https://<人>.github.io/…         →  倉庫名就是 <人>.github.io
+  function cdnBase() {
+    const m = /^([\w-]+)\.github\.io$/.exec(location.hostname);
+    if (!m) return null;
+    const repo = location.pathname.split('/').filter(Boolean)[0] || location.hostname;
+    return 'https://cdn.jsdelivr.net/gh/' + m[1] + '/' + repo + '@main/';
+  }
+
+  // 抓一個檔，邊抓邊回報累計位元組。
+  // 內容直接丟掉 —— 目的只是把瀏覽器的 HTTP 快取塞熱，
+  // 等一下 tfjs 去抓同一個網址就不會再走一次網路。
+  async function pullFile(url, signal, onBytes) {
+    const r = await fetch(url, { signal });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const reader = r.body.getReader();
+    let got = 0;
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      got += chunk.value.length;
+      onBytes(got);
     }
-    localModel.set(key, found);
-    return found;
+    return got;
+  }
+
+  // 落後太多就中止，不要白白佔頻寬。
+  // 差距大的時候（我們就是）輸家只會傳幾十 KB；差距小的時候兩邊都跑完，
+  // 反正那種情況本來就快。
+  const RACE_LEAD = 4, RACE_MIN_BYTES = 512 * 1024;
+
+  function raceSources(sources, file, onBytes) {
+    return new Promise((resolve, reject) => {
+      const ctl = sources.map(() => new AbortController());
+      const got = sources.map(() => 0);
+      let settled = false, lost = 0;
+
+      sources.forEach((src, i) => {
+        pullFile(src.base + '/' + file, ctl[i].signal, (n) => {
+          got[i] = n;
+          const lead = Math.max.apply(null, got);
+          if (lead >= RACE_MIN_BYTES) {
+            for (let j = 0; j < sources.length; j++) {
+              // 歸零是為了進度條：不歸零的話 Math.max 會一直回報這個
+              // 已經停住的數字，贏家追過它之前進度看起來是卡住的。
+              if (got[j] * RACE_LEAD < lead) { ctl[j].abort(); got[j] = 0; }
+            }
+          }
+          onBytes(Math.max.apply(null, got));
+        }).then(() => {
+          if (settled) return;
+          settled = true;
+          for (let j = 0; j < sources.length; j++) if (j !== i) ctl[j].abort();
+          resolve(src);
+        }, () => {
+          // 被自己人中止、連不上、404 —— 對這一局來說都是輸
+          if (++lost >= sources.length && !settled) {
+            settled = true;
+            reject(new Error('沒有一個模型來源能用'));
+          }
+        });
+      });
+    });
+  }
+
+  // 下載進度。提示框與面板都讀這一份，不要各自估一份。
+  const dl = { active: false, got: 0, total: 0, source: '', done: false };
+
+  const MB = (n) => (n / 1048576).toFixed(1);
+
+  // 畫面上只講「還剩多少」，不講來源、不講檔名 —— 那是面板的事。
+  function showDownload() {
+    if (!ui.dl) return;
+    ui.dl.hidden = !dl.active;
+    if (!dl.active) return;
+    const pct = dl.total ? Math.min(100, Math.round(dl.got / dl.total * 100)) : 0;
+    ui.dlFill.style.width = pct + '%';
+    ui.dlText.textContent = '下載辨識模型 ' + pct + '%'
+      + '（' + MB(dl.got) + ' / ' + MB(dl.total) + ' MB）';
+  }
+
+  // 按模型分開記 —— 面板可以換模型，不分開的話換了還是回上一個的網址。
+  let prefetching = null, prefetchKey = null;
+  function prefetchModel(key) {
+    if (prefetching && prefetchKey === key) return prefetching;
+    prefetchKey = key;
+    const m = MODELS[key];
+    if (!m || !m.dir) return (prefetching = Promise.resolve(null));
+
+    const sources = [{ name: '本機', base: m.dir }];
+    const cdn = cdnBase();
+    if (cdn) sources.push({ name: 'CDN', base: cdn + m.dir });
+
+    dl.active = true; dl.got = 0; dl.total = m.bytes; dl.done = false;
+
+    prefetching = (async () => {
+      // 先賽最大的那個檔，順便把它抓完（贏家那份是真的抓完的，不是樣本）
+      const win = await raceSources(sources, m.race, (n) => { dl.got = n; });
+      dl.source = win.name;
+      let base = dl.got;
+      // 其餘的檔從同一個來源抓 —— tfjs 解析 model.json 裡的分片路徑是
+      // 相對於 model.json 的，來源混用的話另一邊不會命中快取
+      for (const f of m.files) {
+        if (f === m.race) continue;
+        base += await pullFile(win.base + '/' + f, undefined, (n) => { dl.got = base + n; });
+      }
+      dl.active = false; dl.done = true;
+      return win.base + '/model.json';
+    })().catch((e) => {
+      // 一個都抓不到就回 null，交給 tfjs 自己去 tfhub 拿
+      dl.active = false; dl.done = true; dl.source = '';
+      console.warn('[模型] 預先下載失敗，改用 tfhub：' + (e && e.message));
+      return null;
+    });
+    return prefetching;
   }
 
   // ---- DOM -----------------------------------------------------------------
@@ -207,6 +339,7 @@
     jump:el('m-jump'), bone:el('m-bone'), side:el('m-side'), arm:el('m-arm'),
     chain:el('m-chain'), chain2:el('m-chain2'), state:el('m-state'),
     panelBtn:el('btn-panel'), hidpi:el('chk-hidpi'),
+    dl:el('dl'), dlFill:el('dl-fill'), dlText:el('dl-text'),
     track:el('m-track'),
     link:el('m-link'), rejMove:el('m-rej-move'), rejTime:el('m-rej-time'),
     rejRange:el('m-rej-range'), gapAvg:el('m-gapavg'), lin:el('m-lin'),
@@ -455,14 +588,16 @@
     const key = ui.model.value;
     const m = MODELS[key];
     if (m.kind === 'movenet') {
-      const url = await localModelUrl(key);
+      // 先把檔案抓下來（有進度可以看），tfjs 等一下讀的是 HTTP 快取。
+      // 抓不到任何來源就回 null，讓 tfjs 自己去 tfhub 拿。
+      const url = await prefetchModel(key);
       const cfg = {
         modelType: poseDetection.movenet.modelType[m.modelType],
         enableSmoothing: ui.smooth.checked,
         minPoseScore: 0.2,
       };
       if (url) cfg.modelUrl = url;
-      modelSource = url ? '本機' : 'CDN';
+      modelSource = url ? (dl.source || '本機') : 'tfhub';
       detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, cfg);
       await warmup();
     } else {
@@ -3576,6 +3711,16 @@
   best = loadBest();
   probeBackends();
   syncBladeOptions();
+
+  // 開頁就先抓模型，讓 4.7MB 的下載跟「讀上面那幾行說明」重疊。
+  // 不 await —— 使用者可以隨時按開始，buildDetector 會等同一個 Promise。
+  // 每 200ms 更新一次進度條就夠了，不要每個 chunk 都碰 DOM。
+  prefetchModel(ui.model.value);
+  // showDownload 自己會在沒在下載時把進度條收起來，所以這個 tick
+  // 不自己停 —— 停掉的話換模型重抓就沒人更新了。200ms 一次幾乎零成本。
+  setInterval(showDownload, 200);
+  // 換模型就重抓（而且是換成那個新的）
+  ui.model.addEventListener('change', () => prefetchModel(ui.model.value));
   const blocked = cameraBlockedWhy();
   if (blocked) { setStatus(blocked, true); ui.start.disabled = true; }
 })();

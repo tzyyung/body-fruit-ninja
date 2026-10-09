@@ -157,6 +157,34 @@ do_check() {
   done
   [ "$any" = 0 ] && printf '  %s要下載：%s models%s\n' "$c_dim" "$0" "$c_0"
 
+  # app.js 的 MODELS 裡寫了每個模型的檔名清單、最大的那一個、以及總位元組數。
+  # 那組數字是下載進度的分母、也決定賽跑拿哪個檔比 —— 漂掉的話進度會
+  # 停在 87% 或衝破 100%，而且沒有任何地方會報錯。
+  printf '%sMODELS 的檔名與大小 vs 磁碟%s\n' "$c_b" "$c_0"
+  if node -e '
+    const fs = require("fs"), src = fs.readFileSync("app.js", "utf8");
+    let bad = 0;
+    for (const m of src.matchAll(/dir: .(models\/[\w-]+)., bytes: (\d+),\s*files: \[([^\]]*)\],\s*race: .([\w.-]+)./g)) {
+      const [, dir, bytes, files, race] = m;
+      const want = files.match(/[\w.-]+\.(json|bin)/g) || [];
+      if (!fs.existsSync(dir)) { console.log("  ○ " + dir + " 未下載，跳過"); continue; }
+      const have = fs.readdirSync(dir).sort();
+      const miss = want.filter((f) => !have.includes(f));
+      const extra = have.filter((f) => !want.includes(f));
+      const total = have.reduce((a, f) => a + fs.statSync(dir + "/" + f).size, 0);
+      const big = have.slice().sort((a, b) =>
+        fs.statSync(dir + "/" + b).size - fs.statSync(dir + "/" + a).size)[0];
+      const err = [];
+      if (miss.length) err.push("少了 " + miss.join(" "));
+      if (extra.length) err.push("多了 " + extra.join(" "));
+      if (Number(bytes) !== total) err.push("bytes 寫 " + bytes + " 實際 " + total);
+      if (race !== big) err.push("race 寫 " + race + " 但最大的是 " + big);
+      if (err.length) { console.log("  ✗ " + dir + "：" + err.join("；")); bad = 1; }
+      else console.log("  ✓ " + dir);
+    }
+    process.exit(bad);
+  '; then :; else fail=1; fi
+
   printf '%s模型權重（CDN 退路）%s\n' "$c_b" "$c_0"
   # tfhub.dev 已退役，會重導到 Kaggle Models。斷掉的話模型載不下來。
   local m='https://tfhub.dev/google/tfjs-model/movenet/singlepose/lightning/4/model.json?tfjs-format=file'

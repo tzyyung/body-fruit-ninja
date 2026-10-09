@@ -151,6 +151,14 @@
   .hint b { font-size:17px; } .hint span { color:var(--dim); }
   /* 開始鈕放畫面正中央，不要埋在右邊面板裡 */
   .hint button { margin-top:16px; justify-self:center; padding:14px 34px; font-size:16px; }
+  /* 下載進度。寬度固定，不然數字跳動時整塊會左右抖。 */
+  .dl { margin-top:14px; justify-self:center; width:min(280px, 80%);
+        display:grid; gap:6px; justify-items:center; }
+  .dl-bar { width:100%; height:4px; border-radius:2px; background:#2a2f3a;
+            overflow:hidden; }
+  .dl-bar i { display:block; height:100%; width:0; background:var(--accent);
+              transition:width .2s linear; }
+  .dl span { font-size:12px; color:var(--dim); font-variant-numeric:tabular-nums; }
 
 </style>
 </head>
@@ -166,6 +174,12 @@
       <span>坐著或站著都可以，重點是手肘不要出框 —— 掌刀是從手肘算出來的。</span>
       <span>按下面的按鈕後，瀏覽器會問要不要用相機，選允許。</span>
       <button id="btn-start">開啟相機</button>
+      <!-- 辨識模型 4.7MB，第一次要下載。讓它跟「讀上面那幾行」重疊，
+           而且要看得到還剩多少 —— 不然使用者不知道是在跑還是卡住了。 -->
+      <div class="dl" id="dl" hidden>
+        <div class="dl-bar"><i id="dl-fill"></i></div>
+        <span id="dl-text"></span>
+      </div>
     </div>
   </div>
 
