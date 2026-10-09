@@ -34,6 +34,12 @@ tfjs 預設從 `tfhub.dev` 抓模型，而那會重導到 Kaggle 拿簽章網址
 | tfhub → Kaggle | 2.24s | 2.41s | 2.73s | **7.4s** |
 | localhost | 0.0011s | 0.0022s | 0.0009s | **4ms** |
 
+線上版（GitHub Pages）又是另一回事 —— 它對大二進位檔限速得很兇。
+同一份 3.8MB 分片：Pages **89.4 秒**（43 KB/s）、jsDelivr **2.96 秒**
+（1385 KB/s）。所以執行期會讓兩個來源**賽跑**，比的是「誰先把最大那個檔
+抓完」，不是誰先回應（Pages 的 TTFB 反而比較快，比延遲會選錯）。
+細節與量測見 [`METHOD.md`](METHOD.md) §5.1b。
+
 瀏覽器內實測建立 detector 的時間：**CDN 5324ms vs 本機 45ms，快 118 倍。**
 
 `./menu.sh models` 會把兩個 MoveNet 抓下來（Lightning 4.7M、Thunder 12M）。

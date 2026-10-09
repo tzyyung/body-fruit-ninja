@@ -23,6 +23,16 @@
 `.nojekyll` 一定要留著 —— 沒有它 Jekyll 會吃掉 `tests/_harness.js` 這種
 底線開頭的檔案。
 
+### 上線後量到、順手修掉的三件事
+
+**模型下載 89 秒 → 2.5 秒。** 使用者回報「載三分鐘還在等」。
+GitHub Pages 對大二進位檔限速到 43 KB/s；jsDelivr 的 `/gh/` 來源是
+1385 KB/s，同一份檔 SHA-256 相同。執行期讓兩個來源賽跑（比吞吐量，
+不是比延遲 —— Pages 的 TTFB 反而比較快，比延遲會選錯；拿 168KB 的
+model.json 當樣本也會選錯，那量到的是冷啟）。線上實測輸家傳 0 KB。
+進度條是自己用 fetch + ReadableStream 做的，因為 pose-detection
+沒有 onProgress 的傳遞路徑。細節見 `docs/METHOD.md` §5.1b / §5.1c。
+
 ### 上線後量到、順手修掉的兩件版面問題
 
 本機看不到是因為我的 localStorage 記著「面板收起來」；線上是全新 origin，
