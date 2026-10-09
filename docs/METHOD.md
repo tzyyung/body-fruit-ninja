@@ -669,7 +669,7 @@ app.js              全部的程式（約 3200 行）
 models/             MoveNet 權重三組（lightning / lightning-uint8 / thunder）
 menu.sh             start/stop/open/check/test/pwlog/models/quantize
 quantize.py         float16 → uint8 再量化（自己寫的，見 5.2）
-tests/              純邏輯單元測試（11 檔 164 條）
+tests/              純邏輯單元測試（11 檔 176 條）
 tests/gestures.js   動作語料產生器
 tests/bdd.js        零相依的 Gherkin 執行器（繁中關鍵字）
 features/           驗收條件（Gherkin）

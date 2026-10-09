@@ -51,7 +51,7 @@
 ```
 
 ```sh
-./menu.sh test                    # 單元測試（11 檔 164 條）
+./menu.sh test                    # 單元測試（11 檔 176 條）
 node tests/bdd.js                 # 驗收條件（36 個 Gherkin 場景）
 ./menu.sh pwlog '關鍵字'          # 看瀏覽器 console（最新那個檔，自動修剪）
 codegraph query / callers / impact  # 查程式，比 grep 準
