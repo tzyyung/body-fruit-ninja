@@ -1845,6 +1845,18 @@
   };
   const FREEZE_MS = 4500, DOUBLE_MS = 7000;
 
+  // 炸彈飛得比水果慢，讓人來得及把手移開。
+  //
+  // 做法是「等價的時間縮放」：速度 ×k、重力 ×k²。
+  // 這樣軌跡的**形狀完全不變**（頂點高度 v²/2g 與水平距離都不變），
+  // 只是走完同一條路要 1/k 倍的時間。
+  // 不能只調速度不調重力 —— 那會變成一顆飛得比較低的炸彈，
+  // 玩家對它的落點預期會錯，反而更容易誤砍。
+  //
+  // k = 0.72 → 滯空從 1.6–2.1 秒拉長到 2.2–2.9 秒，多出約 39% 的反應時間。
+  // 不做得更慢是因為炸彈在畫面上待越久，被亂揮的刀掃到的機會也越多。
+  const BOMB_SLOW = 0.72;
+
   // 連擊：Fruit Ninja 的計分核心 —— 連續切中不失手，倍率往上爬。
   // 視窗 1.1 秒取自 tubakhxn/Webcam-Fruit-Ninja 的 COMBO_WINDOW。
   const COMBO_WINDOW = 1100, COMBO_MAX = 5;
@@ -2017,15 +2029,17 @@
   function spawn() {
     const x = px(0.125) + Math.random() * (cv.width - px(0.25));
     const { kind, bomb, treasure } = pickKind();
+    const slow = bomb ? BOMB_SLOW : 1;
     fruits.push({
       x, y: cv.height + px(F.fruitR),
-      vx: (cv.width / 2 - x) * 0.45 + (Math.random() - 0.5) * 120,
-      vy: -(px(1.19) + Math.random() * px(0.41)),
+      vx: ((cv.width / 2 - x) * 0.45 + (Math.random() - 0.5) * 120) * slow,
+      vy: -(px(1.19) + Math.random() * px(0.41)) * slow,
       ch: kind.ch, color: kind.color,
       bomb: !!bomb, treasure: treasure || null,
-      dead: false, rot: 0, spin: (Math.random() - 0.5) * 4,
-      cuts: [], gen: 0, R: px(F.fruitR),
-      stopFuse: bomb ? startFuse(2.2) : null,
+      dead: false, rot: 0, spin: (Math.random() - 0.5) * 4 * slow,
+      cuts: [], gen: 0, R: px(F.fruitR), slow,
+      // 引信聲要跟著拉長，不然聲音先停了炸彈還在飛
+      stopFuse: bomb ? startFuse(2.2 / slow) : null,
     });
   }
 
@@ -2048,7 +2062,9 @@
     const kept = [];
     for (const f of fruits) {
       if (f.dead) continue;   // 被切開的那塊由它的兩個子塊接手
-      f.vy += g * dt; f.x += f.vx * dt; f.y += f.vy * dt; f.rot += f.spin * dt;
+      // 重力 ×k²：配上生成時的速度 ×k，整條軌跡形狀不變、只是變慢（見 BOMB_SLOW）
+      const fg = g * (f.slow || 1) * (f.slow || 1);
+      f.vy += fg * dt; f.x += f.vx * dt; f.y += f.vy * dt; f.rot += f.spin * dt;
       if (f.y > cv.height + f.R * 3) {
         if (f.stopFuse) { f.stopFuse(); f.stopFuse = null; }
         // 只有完整的水果沒切到才算漏掉；碎塊落地是正常的
