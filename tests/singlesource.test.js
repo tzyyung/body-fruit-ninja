@@ -175,6 +175,33 @@ t('幀間秒數只在 dtSec 的定義裡出現',
   t('每個抽原始碼的測試都接上 H.core()', missing.length ? missing.join('、') : 0, 0);
 }
 
+section('detector 要等暖機完才掛上去；畫面問的是圓圈不是 detector');
+
+// 2026-10-09 Android 實測回報：推論更新 10/秒、但沒有開始圓圈。
+// 原因是 buildDetector 建好就指派、再暖機：
+//   detector 一有值 → 已經在跑的 inferLoop 立刻開始推論（跟首次著色器
+//   編譯搶 GPU），而且 drawReady 的守衛是 if (!detector)，於是畫面顯示
+//   「把手停在圓圈上」—— 可是建立圓圈的 enterReady() 要等 buildDetector
+//   回來才跑。使用者被叫去停一個不存在的圓圈。
+t('warmup 收參數，不吃全域 detector', /async function warmup\(det\)/.test(code), true);
+t('沒有不帶參數的 warmup() 呼叫', count('warmup()'), 0);
+t('detector 不是直接從 createDetector 指派的',
+  (code.match(/detector = await poseDetection\.createDetector/g) || []).length, 0);
+t('warmup 的內文不碰全域 detector', /\bdetector\b/.test(body('warmup')), false);
+// 「畫面上有沒有圓圈」的唯一依據就是圓圈本身
+t('drawReady 不拿 detector 當有沒有圓圈的依據',
+  /\bdetector\b/.test(body('drawReady')), false);
+t('drawReady 問的是 hoverBtns', /hoverBtns/.test(body('drawReady')), true);
+
+section('模型檔同時抓，不要排隊');
+
+// 冷啟實測每個檔要等 1.7–4.7 秒才吐第一個位元組（jsDelivr）。
+// 一個一個抓的話那幾段 TTFB 會疊加，使用者看到的是好幾段「進度完全不動」。
+t('其餘的檔用 Promise.all 同時抓',
+  /Promise\.all\(m\.files/.test(code), true);
+// 舊的寫法是「上一個檔的累計 + 這個檔的目前」，那只在排隊抓時成立
+t('沒有殘留循序累加的寫法', /base \+= await pullFile/.test(code), false);
+
 section('三種尺度一律走 px / py / fs');
 
 // §4.3：絕對像素、畫面寬比例、身體尺度是三種不同的東西，用錯會無聲壞掉。

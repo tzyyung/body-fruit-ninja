@@ -267,19 +267,39 @@
   }
 
   // 下載進度。提示框與面板都讀這一份，不要各自估一份。
-  const dl = { active: false, got: 0, total: 0, source: '', done: false };
+  //   startAt 這一輪什麼時候開始  moveAt 最後一次真的收到位元組
+  const dl = { active: false, got: 0, total: 0, source: '', done: false,
+               startAt: 0, moveAt: 0 };
 
   const MB = (n) => (n / 1048576).toFixed(1);
+  const STALL_MS = 1200;   // 停住多久算「卡住」，要講出來
 
-  // 畫面上只講「還剩多少」，不講來源、不講檔名 —— 那是面板的事。
+  // 畫面上只講「還剩多少、還要多久」，不講來源、不講檔名 —— 那是面板的事。
+  //
+  // 會卡住是常態不是例外：冷啟時每個檔要等 1.7–4.7 秒才吐第一個位元組
+  // （實測 jsDelivr），那段時間百分比不可能動。不講的話看起來就是當掉了，
+  // 使用者只好一直重整。
   function showDownload() {
     if (!ui.dl) return;
     ui.dl.hidden = !dl.active;
     if (!dl.active) return;
+    const now = performance.now();
     const pct = dl.total ? Math.min(100, Math.round(dl.got / dl.total * 100)) : 0;
     ui.dlFill.style.width = pct + '%';
-    ui.dlText.textContent = '下載辨識模型 ' + pct + '%'
-      + '（' + MB(dl.got) + ' / ' + MB(dl.total) + ' MB）';
+
+    const still = now - dl.moveAt;
+    if (still > STALL_MS) {
+      ui.dlText.textContent = dl.got
+        ? '等伺服器回應…（' + pct + '%，已等 ' + Math.round(still / 1000) + ' 秒）'
+        : '正在連線…（已等 ' + Math.round((now - dl.startAt) / 1000) + ' 秒）';
+      return;
+    }
+    // 剩多久＝剩多少 ÷ 到目前為止的平均速度。平均而不是瞬時 ——
+    // 瞬時值在這種斷斷續續的下載裡會跳到沒辦法看。
+    const sec = Math.max((now - dl.startAt) / 1000, 0.3);
+    const left = Math.ceil((dl.total - dl.got) / Math.max(dl.got / sec, 1));
+    ui.dlText.textContent = '下載辨識模型 ' + pct + '%（'
+      + MB(dl.got) + ' / ' + MB(dl.total) + ' MB，約 ' + left + ' 秒）';
   }
 
   // 按模型分開記 —— 面板可以換模型，不分開的話換了還是回上一個的網址。
@@ -295,18 +315,34 @@
     if (cdn) sources.push({ name: 'CDN', base: cdn + m.dir });
 
     dl.active = true; dl.got = 0; dl.total = m.bytes; dl.done = false;
+    dl.startAt = dl.moveAt = performance.now();
 
     prefetching = (async () => {
+      // 每個檔各自記，加起來才是進度。
+      // 原本是「上一個檔的累計 + 這個檔的目前」，那只在一個一個抓時成立。
+      const got = Object.create(null);
+      for (const f of m.files) got[f] = 0;
+      const bump = (f) => (n) => {
+        got[f] = n;
+        let sum = 0;
+        for (const k of m.files) sum += got[k];
+        if (sum > dl.got) dl.moveAt = performance.now();
+        dl.got = sum;
+      };
+
       // 先賽最大的那個檔，順便把它抓完（贏家那份是真的抓完的，不是樣本）
-      const win = await raceSources(sources, m.race, (n) => { dl.got = n; });
+      const win = await raceSources(sources, m.race, bump(m.race));
       dl.source = win.name;
-      let base = dl.got;
-      // 其餘的檔從同一個來源抓 —— tfjs 解析 model.json 裡的分片路徑是
-      // 相對於 model.json 的，來源混用的話另一邊不會命中快取
-      for (const f of m.files) {
-        if (f === m.race) continue;
-        base += await pullFile(win.base + '/' + f, undefined, (n) => { dl.got = base + n; });
-      }
+
+      // 其餘的檔**同時**抓，不要排隊 —— 一個一個抓的話每個檔的 TTFB 會疊加，
+      // 冷啟實測每個檔要等 1.7–4.7 秒才吐第一個位元組，三個檔排隊就是
+      // 三段「進度完全不動」。
+      // 來源一定要跟贏家同一個：tfjs 解析 model.json 裡的分片路徑是相對於
+      // model.json 的，混用的話另一邊不會命中快取，等於白抓一次。
+      await Promise.all(m.files
+        .filter((f) => f !== m.race)
+        .map((f) => pullFile(win.base + '/' + f, undefined, bump(f))));
+
       dl.active = false; dl.done = true;
       return win.base + '/model.json';
     })().catch((e) => {
@@ -561,12 +597,14 @@
 
   // 第一次推論要編譯 shader，會卡一下。模型是背景載入的，
   // 正好在那時候先跑一次空推論，把這個停頓挪到玩家還沒開始之前。
-  async function warmup() {
+  // 收參數，不要用全域的 detector —— 全域那個要等暖機完才掛上去，
+  // 不然 inferLoop 會在暖機還沒好的時候就開始跟它搶 GPU（見 buildDetector）。
+  async function warmup(det) {
     try {
       const c = document.createElement('canvas');
       c.width = 256; c.height = 256;
       const t0 = performance.now();
-      await detector.estimatePoses(c, { flipHorizontal: false });
+      await det.estimatePoses(c, { flipHorizontal: false });
       warmupMs = Math.round(performance.now() - t0);
     } catch (e) { /* 暖機失敗不影響正常運作 */ }
   }
@@ -598,16 +636,24 @@
       };
       if (url) cfg.modelUrl = url;
       modelSource = url ? (dl.source || '本機') : 'tfhub';
-      detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, cfg);
-      await warmup();
+      // 先放區域變數、暖機完才掛到 detector 上。
+      // 原本是建好就指派再暖機 —— 但 detector 一有值，已經在跑的 inferLoop
+      // 立刻開始推論，在慢的裝置上跟首次著色器編譯搶 GPU；而且畫面會因為
+      // 「detector 有了」就顯示「把手停在圓圈上」，可是建立圓圈的 enterReady()
+      // 要等 buildDetector 回來才跑 —— 使用者被叫去停一個不存在的圓圈。
+      // Android 實測回報：推論更新 10/秒、但沒有開始圓圈，就是這個。
+      const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, cfg);
+      await warmup(det);
+      detector = det;
     } else {
       modelSource = 'CDN';
-      detector = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, {
+      const det = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, {
         runtime: 'tfjs',
         modelType: m.modelType,
         enableSmoothing: ui.smooth.checked,
       });
-      await warmup();
+      await warmup(det);
+      detector = det;
     }
   }
 
@@ -3472,11 +3518,11 @@
     ctx.fillStyle = '#e6e8ec';
     ctx.font = '600 ' + fs(22) + 'px -apple-system,"PingFang TC",sans-serif';
 
-    // 模型還沒載好就沒有圓圈（enterReady 才建立它）。
-    // 相機一好就先 phase='ready' 是刻意的 —— 要讓人馬上看到自己 ——
-    // 但畫面不能在這段時間叫他去停一個不存在的圓圈。
-    // 本機模型約 45ms，CDN 要 5–7 秒，後者使用者一定會遇到。
-    if (!detector) {
+    // 「叫人去停圓圈」的前提是圓圈真的畫得出來，所以問的是 hoverBtns，
+    // 不是 detector —— 那兩件事中間隔著暖機，慢的裝置上差好幾秒，
+    // 而這段時間畫面會叫人去停一個不存在的圓圈（Android 實測回報過）。
+    // 相機一好就先 phase='ready' 是刻意的 —— 要讓人馬上看到自己。
+    if (!hoverBtns.length) {
       ctx.fillText('正在準備，稍等一下', px(0.5), py(0.30));
       ctx.font = '400 ' + fs(15) + 'px -apple-system,"PingFang TC",sans-serif';
       ctx.fillStyle = '#9aa3b2';

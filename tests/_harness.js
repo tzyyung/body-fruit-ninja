@@ -17,10 +17,12 @@ const die = (msg) => { console.error('harness: ' + msg); process.exit(2); };
 // 回傳字串讓呼叫端自己 eval —— eval 出來的 function 宣告會綁在呼叫端的
 // 作用域，才看得到測試檔裡準備的替身（stub）。
 function fn(name) {
-  const re = new RegExp('  function ' + name + '\\([\\s\\S]*?\\n  \\}');
+  // async 也要配得到 —— 漏掉的話錯誤訊息是「抽不到函式 X」，
+  // 看起來像名字打錯，實際上是 harness 的洞（踩過：pullFile）。
+  const re = new RegExp('  (?:async )?function ' + name + '\\([\\s\\S]*?\\n  \\}');
   const m = src.match(re);
   if (!m) die('抽不到函式 ' + name);
-  return m[0].replace(/^ {2}function/, 'function');
+  return m[0].replace(/^ {2}(?:async )?function/, (x) => x.trim() === 'function' ? 'function' : 'async function');
 }
 
 // 取 `  const name = <運算式>;` 的右手邊，回傳**原始碼字串**（已包好括號）。
@@ -82,10 +84,24 @@ const EPS = 1e-9;
 const atLeast = (v, min) => v >= min - EPS;
 const below   = (v, min) => v <  min - EPS;
 
+let finished = false;
 function done() {
+  finished = true;
   console.log(fails ? '\n' + fails + '/' + total + ' 項失敗'
                     : '\n全部通過（' + total + ' 項）');
   process.exit(fails ? 1 : 0);
 }
+
+// 非同步測試如果 await 到一個永遠不 settle 的 promise，事件迴圈會空掉，
+// node 就靜靜地以 0 離開 —— 整個檔變成「靜默通過」。
+// 跑變異時實際踩到：把 raceSources 的「全部失敗就 reject」拿掉之後，
+// 測試完全沒有反應，而且是綠的。
+// 只有「用了斷言但沒收尾」才算 —— bdd.js 借 harness 取原始碼，
+// 但它有自己的輸出與離開碼，不走 done()。
+process.on('exit', (code) => {
+  if (finished || code !== 0 || total === 0) return;
+  console.log('\n沒有跑到 done() —— 有 promise 沒有 settle，或是中途 return 了');
+  process.exitCode = 1;
+});
 
 module.exports = { src, fn, expr, core, num, section, t, near, atLeast, below, done };
