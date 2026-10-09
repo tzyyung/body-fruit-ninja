@@ -52,6 +52,9 @@
   // linked 永遠是 false、刀痕永遠不出現。放寬到能容忍 ~4fps。
   const TRAIL_MS    = 280; // 刀痕殘留
   const MAX_LINK_MS = 260; // 兩幀間隔超過就不連（掉點後不要亂連成假刀痕）
+  // 掃過長度到門檻的這個比例就提示「揮大一點」。
+  // 0.5 以下多半不是在揮刀（調整姿勢、把手移到按鈕上），提示了只是噪音。
+  const NEAR_SLASH = 0.5;
   const GRAVITY_F   = 1.53;  // 每秒每秒幾個畫面寬（tubakhxn 的 1850@720p 換算）
 
   // 原版《水果忍者》砍到炸彈是直接結束，但體感操作的追蹤本來就會抖，
@@ -1052,10 +1055,12 @@
     //
     // 三種判準的誤判率都是 0%，所以選涵蓋面最好的那個。
     const sweep = sweepOf(run);
-    const slashing = !gateMoving() || sweep >= slashMinPx();
+    const need = slashMinPx();
+    const slashing = !gateMoving() || atLeast(sweep, need);
     stats.strokeMax = Math.max(stats.strokeMax, sweep);
     stats.linSum += fit.linearity; stats.linN++;
-    return { run, fit, straight, slashing };
+    // sweep / need 帶出去，畫面才知道「差一點」跟「根本沒揮」要分開處理
+    return { run, fit, straight, slashing, sweep, need };
   }
 
   // ---- 自適應量（Tracked）--------------------------------------------------
@@ -1326,14 +1331,38 @@
 
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
+  // 「這個情況已經連續成立多久了」。
+  //
+  // 兩道閘門需要同一件事：擋得太久就要認帳（人可能真的移動了、換姿勢了、
+  // 走近了）。原本各寫一份 —— gateJumps 的 p.heldSince、gateBones 的
+  // boneBad —— 同一個模式兩份實作一定會漂走。
+  //
+  // active 為 false 就清掉計時（情況消失了，下次要從頭算）。
+  const heldSince = {};
+  function heldFor(key, now, active) {
+    if (!active) { delete heldSince[key]; return 0; }
+    if (!heldSince[key]) heldSince[key] = now;
+    return now - heldSince[key];
+  }
+
   // 骨長的滾動中位數。用中位數不用平均，因為平均會被跳動本身拉走 ——
   // 而我們正是要用這個值去判斷跳動。
-  function boneLength(name, v) {
+  // 讀中位數，**不寫入**。
+  //
+  // 原本是「先 push 再取中位數」—— 連它正要判定為錯誤的那些長度也照收。
+  // 連續 16 幀壞資料（0.5 秒 @30fps）之後中位數本身就變成錯誤長度，
+  // 骨長檢查從此對這個錯誤完全沉默。判準不可以被它要擋的東西汙染。
+  function boneMedian(name) {
+    const w = boneMed[name];
+    if (!w || !w.length) return 0;
+    const srt = [...w].sort((a, b) => a - b);
+    return srt[srt.length >> 1];
+  }
+
+  function pushBone(name, v) {
     const w = boneMed[name] || (boneMed[name] = []);
     w.push(v);
     if (w.length > 31) w.shift();
-    const srt = [...w].sort((a, b) => a - b);
-    return srt[srt.length >> 1];
   }
 
   // 1) 左右身分：模型會把左右手整個標反，造成點橫跨身體瞬移。
@@ -1373,23 +1402,32 @@
         const p = joint[name];
         if (p) {
           const dt = Math.max((now - p.t) / 1000, 1e-3);
-          const speed = dist(k, p) / dt;
-          const held = p.heldSince ? now - p.heldSince : 0;
-          if (speed > maxSpeedPx() && held < HOLD_MAX_MS) {
+          const tooFast = dist(k, p) / dt > maxSpeedPx();
+          if (tooFast && heldFor('jump:' + name, now, true) < HOLD_MAX_MS) {
             kp[name] = { x: p.x, y: p.y, score: k.score, name };
-            p.heldSince = p.heldSince || now;
             p.t = now;
             stats.jumpGate++;
             continue;
           }
         }
-        joint[name] = { x: k.x, y: k.y, t: now, heldSince: 0 };
+        heldFor('jump:' + name, now, false);
+        joint[name] = { x: k.x, y: k.y, t: now };
       }
     }
   }
 
   // 3) 骨長合理性：上臂、前臂的長度不會突然變成兩倍。
   //    會變就是末端那個點抓錯了，沿用上一個。
+  // 骨長合理性：上臂、前臂的長度不會突然變成兩倍。會變就是末端那個點抓錯了。
+  //
+  // 這支要排在 gateJumps **之前**。
+  // 原本排在後面是恆等變換：gateJumps 接受一個點時已經把那個（可能錯的）
+  // 座標寫進 joint[]，gateBones 再從同一筆「還原」＝寫回一模一樣的值。
+  // 三條路徑全是恆等，但 stats.boneGate 照樣累加 ——
+  // 面板上是一道**回報成功的失效防線**，那比沒有防線更糟，
+  // 因為它會讓下一輪的除錯指向錯方向。
+  const BONE_RESET_MS = 700;          // 擋這麼久就認帳：人真的換了姿勢或距離
+
   function gateBones(kp, now) {
     for (const side of SIDES) {
       for (const [a, b] of [['shoulder', 'elbow'], ['elbow', 'wrist']]) {
@@ -1397,13 +1435,27 @@
         if (!ka || !kb) continue;
         const name = side + '_' + a + '_' + b;
         const len = dist(ka, kb);
-        const med = boneLength(name, len);
-        if (med > 4 && (len < med * BONE_LO || len > med * BONE_HI)) {
-          const p = joint[side + '_' + b];
-          if (p && now - (p.heldSince || now) < HOLD_MAX_MS) {
-            kp[side + '_' + b] = { x: p.x, y: p.y, score: kb.score, name: kb.name };
-            stats.boneGate++;
-          }
+        const med = boneMedian(name);
+        const ok = !(med > 4) || (len >= med * BONE_LO && len <= med * BONE_HI);
+
+        if (ok) {
+          pushBone(name, len);        // 只有通過的樣本才進判準
+          heldFor('bone:' + name, now, false);
+          continue;
+        }
+
+        // 連續擋太久就認帳 —— 人真的走近／換姿勢時骨長本來就會變，
+        // 一直擋下去會變成「判準永遠回不到正確值」的另一種鎖死。
+        if (heldFor('bone:' + name, now, true) > BONE_RESET_MS) {
+          boneMed[name] = [len];
+          heldFor('bone:' + name, now, false);
+          continue;
+        }
+
+        const p = joint[side + '_' + b];
+        if (p) {
+          kp[side + '_' + b] = { x: p.x, y: p.y, score: kb.score, name: kb.name };
+          stats.boneGate++;
         }
       }
     }
@@ -1447,8 +1499,11 @@
     if (!ui.stable.checked) return;
     dropOffFrame(kp);
     fixSides(kp);
-    gateJumps(kp, now);
+    // 順序有意義：gateBones 要在 gateJumps 之前。
+    // 反過來的話 gateJumps 已經把當前座標寫進 joint[]，
+    // gateBones 再從同一筆還原就是恆等變換（見 gateBones 的註解）。
     gateBones(kp, now);
+    gateJumps(kp, now);
   }
 
   // ---- 懸停按鈕（Kinect 式）------------------------------------------------
@@ -1874,6 +1929,10 @@
       } else if (kind === 'bomb') {
         noiseBurst(0.5, { type: 'lowpass', freq: 900, gain: 0.45, sweepTo: 90 });
         tone(70, 0.4, { type: 'sawtooth', gain: 0.22, to: 32 });
+      } else if (kind === 'whiff') {
+        // 漏接：一聲悶悶的下滑音。要聽得出來「有東西過去了」，
+        // 但不能像被處罰 —— 漏接本來就不扣命。
+        tone(260, 0.13, { type: 'sine', gain: 0.07, to: 170 });
       } else if (kind === 'miss') {
         tone(220, 0.16, { type: 'sine', gain: 0.14, to: 150 });
       } else if (kind === 'over') {
@@ -2037,6 +2096,13 @@
   // 比「從長時間取第 10 百分位」直接得多，也快得多。
   const REST_MS = 2500;
 
+  // 浮動的文字（切中的分數、漏掉、炸彈扣分…）。
+  // 三個地方各自組一份物件，欄位遲早會漂 —— 統一從這裡出。
+  function popText(x, y, text, color) {
+    pops.push({ x, y: Math.min(y, cv.height - px(0.06)),
+                text, color, t: performance.now() });
+  }
+
   let bits  = [];    // 果汁顆粒
   let marks = [];    // 切痕閃光 / 炸彈環
   let pops  = [];    // 切中時往上飄的分數
@@ -2055,7 +2121,7 @@
     stats.treasures++;
     sfx(t.sound);
     marks.push({ kind: 'boom', x: f.x, y: f.y, t: now, R: f.R });
-    pops.push({ x: f.x, y: f.y, text: t.label, color: t.color, t: now });
+    popText(f.x, f.y, t.label, t.color);
     for (let i = 0; i < 16; i++) {
       const a = Math.random() * Math.PI * 2, v = px(0.1) + Math.random() * px(0.4);
       bits.push({ x:f.x, y:f.y, vx:Math.cos(a)*v, vy:Math.sin(a)*v,
@@ -2124,15 +2190,16 @@
     const g = px(GRAVITY_F);
     bits = bits.filter((b) => {
       b.vy += g * dt; b.x += b.vx * dt; b.y += b.vy * dt;
-      return b.y < cv.height + 20 && performance.now() - b.t < 900;
+      return b.y < cv.height + 20 && now - b.t < 900;
     });
-    marks = marks.filter((m) => performance.now() - m.t < (m.kind === 'boom' ? 420 : 200));
-    pops = pops.filter((p) => { p.y -= 46 * dt; return performance.now() - p.t < 700; });
+    marks = marks.filter((m) => now - m.t < (m.kind === 'boom' ? 420 : 200));
+    pops = pops.filter((p) => { p.y -= 46 * dt; return now - p.t < 700; });
   }
 
   function stepFruits(dt) {
+    const now = performance.now();
     // 慢動作只放慢水果，手的追蹤與刀痕維持原速 —— 不然會變成整個遊戲變鈍
-    if (performance.now() < freezeUntil) dt *= 0.42;
+    if (now < freezeUntil) dt *= 0.42;
     const g = px(GRAVITY_F);
     const kept = [];
     for (const f of fruits) {
@@ -2149,17 +2216,27 @@
         // 實測一局 9 切 5 漏，命三顆根本撐不過開頭。只有炸彈扣命。
         if (!f.bomb && !f.treasure && f.gen === 0) {
           stats.misses++;
-          comboN = 0;   // 漏接仍然中斷連擊，那是技術問題不是處罰
+          // 漏接要看得見也聽得見。
+          //
+          // 原本完全沉默：沒聲音、沒字，而且連擊數字當幀消失 ——
+          // 12 連擊瞬間歸零沒有任何過場，玩家會覺得是程式吃掉了。
+          // 漏接不扣命（那是體感追蹤本來就會有的失誤，罰了等於罰系統自己），
+          // 但「發生了什麼」一定要說。
+          const broke = comboN >= 3;      // 3 連擊以上才值得特別提
+          comboN = 0;                     // 漏接仍然中斷連擊
+          sfx('whiff');
+          popText(f.x, f.y, broke ? '連擊斷了' : '漏掉了',
+                  broke ? '#fbbf24' : '#9aa3b2');
         }
       } else kept.push(f);
     }
     fruits = kept;
     bits = bits.filter((b) => {
       b.vy += g * dt; b.x += b.vx * dt; b.y += b.vy * dt;
-      return b.y < cv.height + 20 && performance.now() - b.t < 900;
+      return b.y < cv.height + 20 && now - b.t < 900;
     });
-    marks = marks.filter((m) => performance.now() - m.t < (m.kind === 'boom' ? 420 : 200));
-    pops = pops.filter((p) => { p.y -= 46 * dt; return performance.now() - p.t < 700; });
+    marks = marks.filter((m) => now - m.t < (m.kind === 'boom' ? 420 : 200));
+    pops = pops.filter((p) => { p.y -= 46 * dt; return now - p.t < 700; });
   }
 
   function segDist(px, py, ax, ay, bx, by) {
@@ -2182,7 +2259,7 @@
       sfx('bomb');
       loseLife('砍到炸彈');
       marks.push({ kind:'boom', x:f.x, y:f.y, t:now, R });
-      pops.push({ x: f.x, y: f.y, text: '−10', color: '#f87171', t: now });
+      popText(f.x, f.y, '−10', '#f87171');
       for (let i = 0; i < 18; i++) {
         const a = Math.random() * Math.PI * 2, v = px(0.12) + Math.random() * px(0.5);
         bits.push({ x:f.x, y:f.y, vx:Math.cos(a)*v, vy:Math.sin(a)*v,
@@ -2205,8 +2282,8 @@
 
     sfx(crit ? 'crit' : 'slice', crit ? 0 : f.gen);
     if (comboN >= 2) sfx('combo', comboN);
-    pops.push({ x: f.x, y: f.y, t: now, text: '+' + gained,
-                color: crit ? '#fbbf24' : (mult > 1 ? '#67e8f9' : '#e6e8ec') });
+    popText(f.x, f.y, '+' + gained,
+            crit ? '#fbbf24' : (mult > 1 ? '#67e8f9' : '#e6e8ec'));
     if (f.gen < MAX_GEN) stats.maxGen = Math.max(stats.maxGen, f.gen + 1);
 
     marks.push({ kind:'cut', x:f.x, y:f.y, a:cutAngle, t:now, R });
@@ -2692,6 +2769,28 @@
     for (const side of SIDES) {
       const tr = trails[side], bs = bases[side];
       const st = strokeFor(side);
+      // 差一點點就要讓他知道，不然這是最沉默的一種失敗：
+      // 刀痕不畫、水果穿過去、一個字都沒有 —— 玩家分不出是自己揮太小
+      // 還是程式壞了，只會覺得「這遊戲判定很爛」。
+      //
+      // 只在「有在動而且已經揮了一半以上」時提示。低於一半的多半不是
+      // 在揮刀（調整姿勢、移到按鈕上），提示了只會變成畫面上的噪音。
+      if (st && !st.slashing && st.sweep >= st.need * NEAR_SLASH) {
+        ctx.save();
+        ctx.setLineDash([6, 6]);
+        ctx.strokeStyle = 'rgba(251,191,36,0.45)';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(st.fit.x1, st.fit.y1); ctx.lineTo(st.fit.x2, st.fit.y2);
+        ctx.stroke();
+        ctx.restore();
+        const mx = (st.fit.x1 + st.fit.x2) / 2, my = (st.fit.y1 + st.fit.y2) / 2;
+        ctx.fillStyle = 'rgba(251,191,36,0.85)';
+        ctx.font = '600 14px -apple-system,"PingFang TC",sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText('揮大一點', mx, my - 18);
+      }
+
       // 只有真的算一刀的時候才畫刀痕。
       // 畫了卻切不到會讓人以為是判定失靈，而不是自己揮得不夠。
       if (st && st.slashing) {

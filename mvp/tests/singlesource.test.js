@@ -74,6 +74,11 @@ section('門檻比較一律走容差函式');
 }
 t('容差只有一個定義', count('const EPS ='), 1);
 
+t('浮動文字只能從 popText 出', count('pops.push('), 1);
+t('「持續多久」只有一份實作', count('function heldFor('), 1);
+t('沒有人自己記 heldSince（要走 heldFor）',
+  count('heldSince') - count('const heldSince') - count('heldSince[key]') * 1, 0);
+
 section('接線：每一道關卡都要真的被呼叫');
 
 // 「測得到函式」不等於「函式有被接上」。

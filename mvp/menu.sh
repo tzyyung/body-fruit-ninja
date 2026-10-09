@@ -256,15 +256,22 @@ do_pwlog() {
 }
 
 do_test() {
-  local f fail=0
+  local f ok=0 bad=0 failed=""
   for f in tests/*.test.js; do
     [ -f "$f" ] || { printf '  還沒有測試\n'; return 0; }
     printf '%s%s%s\n' "$c_b" "${f##*/}" "$c_0"
-    if node "$f"; then :; else fail=1; fi
+    if node "$f"; then
+      ok=$((ok + 1))
+    else
+      bad=$((bad + 1)); failed="$failed ${f##*/}"
+    fi
   done
-  [ "$fail" = 0 ] && printf '\n%s全部通過%s\n' "$c_g" "$c_0" \
-                  || printf '\n%s有測試失敗%s\n' "$c_r" "$c_0"
-  return "$fail"
+  # 結論一定要帶數字，而且失敗的檔名要再列一次 ——
+  # 一百多行通過的輸出會把中間的失敗捲掉，而「全部通過」這種字串
+  # 用 grep 找的時候會跟每個測試檔自己印的那行撞在一起。
+  printf '\n測試結果：%s 檔通過 / %s 檔失敗\n' "$ok" "$bad"
+  [ "$bad" = 0 ] || printf '%s失敗的：%s%s\n' "$c_r" "$failed" "$c_0"
+  [ "$bad" = 0 ]
 }
 
 do_log() {
