@@ -468,7 +468,12 @@
   function continuity(side, kp, now) {
     const h = chainHist[side];
     if (!h || now - h.t > CHAIN_MEM_MS) return 0;
-    const scale = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
+    // 尺度優先用校正前臂，沒有就用當幀肩寬換算（前臂≈0.63 肩寬），
+    // 最後才退回畫面比例。px(0.09) = 57.6px，預算只有 32px/幀，
+    // 手肘被模型亂猜時一定過不了。
+    const sw = shoulderWidth(kp);
+    const scale = (calib && calib.forearm > 4) ? calib.forearm
+                : (sw > 4) ? sw * 0.63 : px(0.09);
     // 允許的位移隨經過時間放大，掉幀時才不會誤判成接不上
     const budget = scale * CHAIN_MOVE * Math.max(1, (now - h.t) / 33);
     let worst = 0;
@@ -510,8 +515,17 @@
       const d = llr('chain', okChain) + llr('cont', okCont) + llr('strong', okStrong);
       track[side] = Math.min(SPRT_A, Math.max(SPRT_B, track[side] + d));
       latch(side);
-      if (!confirmed[side] && track[side] <= SPRT_B) chainHist[side] = null;
-      else rememberChain(side, kp, now);
+      // 歷史無條件記下來。
+      //
+      // 原本是「Λ 掉到下界就把歷史清掉」，那會死鎖：沒有歷史 → continuity
+      // 回 0 → 證據變成 鏈✓續✗強✓ = +1.153 −2.365 +0.827 = −0.385，每幀都是負的
+      // → Λ 釘死在下界 → 歷史又被清掉。就算幾何完全正確也永遠爬不出來。
+      // 實測使用者端 32 筆取樣全部 續=false(0.00)、Λ=-2.99 一動也不動。
+      //
+      // 「續」這項證據依賴歷史，不能在它最需要歷史的時候把歷史刪掉。
+      // 歷史只是「這條鏈上一幀在哪」，不是獎勵 —— 幽靈鏈穩定的話本來就
+      // 該拿到這一分，那是 EV.cont 的 0.92/0.15 已經算進去的假設。
+      rememberChain(side, kp, now);
     }
   }
 
