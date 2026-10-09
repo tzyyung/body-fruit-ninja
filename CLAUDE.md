@@ -3,6 +3,25 @@
 用一般視訊鏡頭取代 Kinect 的體感切水果。純前端，TF.js + MoveNet。
 設計細節與量測數字在 `mvp/README.md`，**這份只寫「怎麼動手」**。
 
+```
+mvp/index.html   畫面骨架、面板、CDN script 標籤（約 220 行）
+mvp/app.js       全部的程式（約 2700 行）
+```
+
+**程式一律寫在 `app.js`，不要寫回 `index.html` 的內嵌 `<script>`。**
+內嵌的話 codegraph 索引不到（它不解析 HTML），
+整份檔案就退回只能用 grep 找 —— `menu.sh check` 會擋這件事。
+
+查程式用 codegraph，比 grep 準：
+
+```sh
+codegraph query <關鍵字>      # 找符號
+codegraph callers <函式名>    # 誰呼叫它
+codegraph callees <函式名>    # 它呼叫誰
+codegraph impact <函式名>     # 改它會影響到哪些地方
+codegraph sync .              # 改完程式後重新索引
+```
+
 ---
 
 ## 1. 工作流程（硬規定）
@@ -83,7 +102,7 @@ git diff HEAD~1          # 或 HEAD~2、HEAD~3
 
 # ② 純邏輯單元測試（抽函式出來在 node 跑，不需要瀏覽器）
 #    適用：幾何、統計、狀態機、機率。寫成斷言，印出實際數字。
-python3 -c "<用 regex 從 index.html 抽函式>" > /tmp/t.js && node /tmp/t.js
+python3 -c "<用 regex 從 app.js 抽函式>" > /tmp/t.js && node /tmp/t.js
 ```
 
 ③ **瀏覽器載入**：零 console error。

@@ -1,0 +1,2681 @@
+(() => {
+  'use strict';
+
+  // ---- 參數 ----------------------------------------------------------------
+  // 所有距離都寫成「畫面寬度的比例」而不是絕對像素。
+  // 相機可能給 640x480 也可能給 1280x720，寫死像素的話門檻會隨解析度無聲偏移。
+  // 比例值取自兩個已驗證的 OSS 專案：collidingScopes 用正規化座標的 0.02 當移動
+  // 門檻，posenet_fruit_ninja 用 0.3 * videoWidth 當最大連線距離。
+  const F = {
+    fastSpeed: 1.40,   // 每秒移動幾個畫面寬 → 超過算「快揮」
+    maxLink:   0.35,   // 兩幀間位移超過幾個畫面寬就不連線
+    // 「有沒有揮出一刀」用整段軌跡掃過的長度來判，不用單幀速度。
+    //
+    // 單幀速度很吵 —— 抖動會把它頂上去，所以門檻放低會誤判成在揮、
+    // 放高又會漏掉真的揮擊，怎麼調都是在兩種壞之間選。
+    // 整段長度是 280ms 的累積量，抖動在裡面會互相抵消，穩定得多：
+    //   手放著不動（含追蹤抖動）  掃過 < 20px
+    //   真的揮一刀                掃過 150–300px
+    // 0.12 是量出來的（各 4000 次模擬，視窗 280ms）：
+    //   靜止（抖 6px）誤判成揮   0.09→0%    0.12→0%
+    //   慢移 200px/s 誤判成揮    0.09→32%   0.12→0%     ← 0.09 在這裡失守
+    //   輕揮 350px/s 被漏掉      0.12→0%    0.15→31%    ← 再高就開始漏真揮擊
+    slashMin:  0.12,   // 筆畫要掃過 12% 畫面寬（640 寬時約 77px）才算一刀
+    moveSpeed: 0.25,   // 仍保留給「快揮掉點率」的量測用
+    // 兩把刀靠得比這還近就不可能是兩隻手。
+    // 原本 0.016（640 寬時才 10px）遠遠不夠 —— 單手舉起時模型會替
+    // 另一隻手猜一個位置，常常落在真手旁邊幾十個像素，生出第二把刀。
+    // 實測截圖裡兩把刀相距 90px，舊門檻 10px 完全擋不到。
+    lrMin:     0.11,
+    fruitR:    0.053,
+  };
+  const px = (frac) => frac * cv.width;
+
+  let MIN_SCORE   = 0.3;   // 由面板調整
+  // 原本 150/120ms 是假設跑在 30fps 以上。推論掉到 8fps 時幀間隔就 >120ms，
+  // linked 永遠是 false、刀痕永遠不出現。放寬到能容忍 ~4fps。
+  const TRAIL_MS    = 280; // 刀痕殘留
+  const MAX_LINK_MS = 260; // 兩幀間隔超過就不連（掉點後不要亂連成假刀痕）
+  const GRAVITY_F   = 1.53;  // 每秒每秒幾個畫面寬（tubakhxn 的 1850@720p 換算）
+
+  // 原版《水果忍者》砍到炸彈是直接結束，但體感操作的追蹤本來就會抖，
+  // 誤砍的機率比觸控高得多，一刀斃命會讓人覺得是程式在找碴。
+  // 改成跟漏接一樣扣一條命。
+  const LIVES = 3;
+  const BEST_KEY = 'watermelon.best';
+
+  // 難度曲線，取自 tubakhxn/Webcam-Fruit-Ninja 試玩調出來的值
+  const SPAWN_MS_0 = 1150, SPAWN_MS_MIN = 280, SPAWN_ACCEL = 17;
+  const BOMB_P_0 = 0.03, BOMB_P_GAIN = 0.002, BOMB_P_CAP = 0.20;
+
+  // 手刀的擊打面是手掌小指側那條邊，端點是手腕與小指指節。
+  // 指節到小指尖還有一段，所以把向量延長一點讓刀刃長度接近真實手掌。
+  const TIP_EXTEND = 1.45;
+
+  // 掌刀位置 = 從手腕沿「手肘→手腕」這條線再往前 10cm。
+  //
+  // 關鍵是用「前臂長的幾倍」而不是寫死像素：成人前臂（肘到腕）約 25cm，
+  // 所以 10cm = 前臂的 0.4 倍。前臂在畫面上的像素長度會隨人站遠站近縮放，
+  // 用比例表示就會自動跟著校正 —— 寫死像素偏移量的話，人一退後掌刀就跑掉。
+  //
+  // 另外手腕和手肘這兩點 MoveNet 與 BlazePose 都有，不必依賴小指指節
+  // 那個低信心的點。
+  const FOREARM_CM = 25;
+  const PALM_CM    = 10;   // 手腕往前多少公分算手掌
+  const TIP_CM     = 18;   // 指尖附近，當對照用
+  const PALM_K = PALM_CM / FOREARM_CM;   // 0.40
+  const TIP_K  = TIP_CM  / FOREARM_CM;   // 0.72
+
+  // 手掌是一個面而不是一個點，命中半徑給它一點加成
+  const PALM_PAD = 0.012;
+
+  // ── 抖動處理 ──
+  // 掌刀 = 手腕 + K×(手腕−手肘)，手腕的估測誤差在這裡被放大 1.4 倍、
+  // 手肘再貢獻 0.4 倍，所以掌刀點比手腕本身更抖，連成線就是折線。
+  //
+  // 點的抖動交給 tfjs 內建的 enableSmoothing —— 它用的是 One Euro Filter
+  // （Casiez et al., CHI 2012），截止頻率隨速度自適應：
+  //   α = 1/(1 + τ/Te),  τ = 1/(2π·fc),  fc = minCutOff + beta·|ẋ|
+  // bundle 內的預設是 {frequency:30, minCutOff:0.05, beta:80, derivateCutOff:1}。
+  // 慢的時候重度平滑（抖動看得見、延遲看不見），快的時候放寬（不削揮擊尖峰）。
+  // 不要在這之上再自己疊一層 EMA —— 兩層濾波只會多加延遲，不會更穩。
+  //
+  // 刀痕的「形狀」是另一件事：一刀揮下去在 150–250ms 內本來就是直的，
+  // 所以對軌跡點做直線擬合。那是對已經收到的點做幾何變換，零延遲。
+  // 擬合殘差太大表示那其實是一道弧（故意畫圈），就不要硬拉直。
+  //
+  // 0.975 這個門檻是量出來的，不是猜的（各 2000 次模擬）：
+  //   真實揮擊（總長 ≥ 88px、抖動 6–14px）  最小 0.9859
+  //   1/4 圓弧                              最大 0.9641
+  //   1/3 圓、半圓                          0.92 以下
+  //   1/8 圓以內                            0.985（跟直線分不開，但它本來
+  //                                          就幾乎是直的，壓平看不出來）
+  // 太短的筆畫直線度本身不穩（35px 時最低掉到 0.916），所以另外加長度下限；
+  // 沒過的就照原樣畫折線 —— 那種情況下折線也很短，看起來沒問題。
+  const MIN_LINEARITY = 0.975;
+  const MIN_STROKE = 0.045;   // 佔畫面寬的比例，約 29px @640
+
+  // MoveNet 只有 COCO 17 點，最末端就是手腕、沒有任何手指或指節。
+  // 要刀刃就只能從前臂方向外推：手長約前臂的 0.7，掌緣中段取 0.55。
+  const EXTRAP_K = 0.55;
+
+  const MODELS = {
+    'blazepose-lite':    { kind: 'blazepose', modelType: 'lite' },
+    'blazepose-full':    { kind: 'blazepose', modelType: 'full' },
+    'movenet-lightning': { kind: 'movenet',   modelType: 'SINGLEPOSE_LIGHTNING',
+                           local: 'models/movenet-lightning/model.json' },
+    'movenet-lightning-uint8': { kind: 'movenet', modelType: 'SINGLEPOSE_LIGHTNING',
+                           local: 'models/movenet-lightning-uint8/model.json' },
+    'movenet-thunder':   { kind: 'movenet',   modelType: 'SINGLEPOSE_THUNDER',
+                           local: 'models/movenet-thunder/model.json' },
+  };
+
+  // 模型預設是從 tfhub.dev 抓，而那會重導到 Kaggle 拿簽章網址 ——
+  // 實測 model.json 加兩個權重分片要 7.4 秒，使用者就是在那裡乾等。
+  // 同樣三個檔從 localhost 讀只要 4 毫秒。
+  // 本機沒有就回去用 CDN，所以 ./menu.sh models 沒跑過也不會壞。
+  const localModel = new Map();
+  async function localModelUrl(key) {
+    if (localModel.has(key)) return localModel.get(key);
+    const u = MODELS[key] && MODELS[key].local;
+    let found = null;
+    if (u) {
+      try {
+        const r = await fetch(u, { method: 'HEAD' });
+        if (r.ok) found = u;
+      } catch (e) { /* 沒有就算了，回去用 CDN */ }
+    }
+    localModel.set(key, found);
+    return found;
+  }
+
+  // ---- DOM -----------------------------------------------------------------
+  const cv  = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const video = document.createElement('video');
+  video.playsInline = true; video.muted = true;
+  video.style.display = 'none';
+  document.body.appendChild(video);
+
+  const el = (id) => document.getElementById(id);
+  const ui = {
+    fps:el('m-fps'), ifps:el('m-ifps'), camDrop:el('m-camdrop'), warm:el('m-warm'),
+    p50:el('m-p50'), p95:el('m-p95'), det:el('m-det'), drop:el('m-drop'),
+    blade:el('m-blade'), forearm:el('m-forearm'), noise:el('m-noise'),
+    ms:el('m-ms'), cusum:el('m-cusum'),
+    speed:el('m-speed'),
+    gap:el('m-gap'), hit:el('m-hit'),
+    miss:el('m-miss'), bomb:el('m-bomb'), tre:el('m-tre'),
+    combo:el('m-combo'), crit:el('m-crit'), lr:el('m-lr'),
+    jump:el('m-jump'), bone:el('m-bone'), side:el('m-side'), arm:el('m-arm'),
+    chain:el('m-chain'), chain2:el('m-chain2'), state:el('m-state'),
+    track:el('m-track'),
+    link:el('m-link'), rejMove:el('m-rej-move'), rejTime:el('m-rej-time'),
+    rejRange:el('m-rej-range'), gapAvg:el('m-gapavg'), lin:el('m-lin'),
+    stroke:el('m-stroke'), gen:el('m-gen'),
+    backend:el('m-backend'), src:el('m-src'), tensors:el('m-tensors'),
+    status:el('status'), hint:el('hint'),
+    start:el('btn-start'), reset:el('btn-reset'), demo:el('btn-demo'),
+    cmp:el('btn-cmp'), probe:el('btn-probe'), result:el('result'),
+    again:el('btn-again'),
+    backendSel:el('sel-backend'), model:el('sel-model'), bladeSel:el('sel-blade'),
+    smooth:el('chk-smooth'), skel:el('chk-skel'), scoreSel:el('sel-score'),
+    gate:el('chk-gate'), straight:el('chk-straight'), sound:el('chk-sound'),
+    stable:el('chk-stable'), small:el('chk-small'), raw:el('chk-raw'),
+  };
+
+  // ---- 狀態 ----------------------------------------------------------------
+  let detector = null, running = false, lastVideoTime = -1, lastPose = null;
+  let backendReady = false, panelBroken = false, modelSource = '—';
+  let warmupMs = 0;
+  let paused = false, lastFrameAt = 0, lastFrameTime = -1;
+  let readyAt = 0;
+  // requestVideoFrameCallback 會在「真的有新影格」時觸發，
+  // 比輪詢 video.currentTime 精確，而且 presentedFrames 可以算出漏了幾格。
+  const hasRVFC = typeof HTMLVideoElement !== 'undefined'
+    && typeof HTMLVideoElement.prototype.requestVideoFrameCallback === 'function';
+  let newFrame = false, lastPresented = 0, droppedFrames = 0, rvfcAt = 0;
+  let small = null;   // 送推論用的縮圖畫布
+  // 每次 startLoops 換一個 token。舊迴圈拿著舊 token 就會自己退場 ——
+  // 光檢查 running 不夠：舊的 inferLoop 可能正卡在 await 中間，
+  // resolve 時 running 已經被重設為 true，它就會繼續跑成第二條迴圈。
+  let loopToken = 0;
+  let fruits = [], nextSpawn = 0, score = 0, lastT = 0;
+  let lives = LIVES, over = false, best = 0;
+  let freezeUntil = 0, doubleUntil = 0;
+  let comboN = 0, comboAt = 0;
+  let hurtAt = 0, hurtWhy = '', overWhy = '';
+  // 判斷「有沒有人」用的是「有沒有可用的刀刃」，不是「有沒有回傳姿勢」——
+  // 模型可能回傳一個信心很低、關節全錯的姿勢，那對玩家來說等於沒人。
+  const NO_PERSON_MS = 1200;
+  let lastBladeAt = 0, lostPerson = false;
+  // 示範按鈕是沒有相機時的開發工具，不該被「沒看到人」擋住
+  let demoMode = false;
+  // 滾動樣本。n 越多，量測值的權重越高；一個樣本都沒有就是純預設值。
+  let calib = null;
+  // idle：還沒開相機 / ready：看得到自己、等懸停開始 / playing：遊戲中 / over：結束
+  let phase = 'idle';
+  const SIDES = ['left', 'right'];
+  const trails = { left: [], right: [] };   // 刀尖軌跡
+  const bases  = { left: [], right: [] };   // 刀柄（手腕）軌跡
+  const prev   = { left: null, right: null };
+  const joint  = {};            // 關節名 → { x, y, t, heldSince }
+  // 每一側上一次被信任的鏈，用來判斷延續性
+  const chainHist = { left: null, right: null };
+  // 每一側累積的對數勝算比，以及「已確認」這個鎖存狀態。
+  //
+  // SPRT 的決策是鎖存的：兩個界限之間維持上一次的判定，不重新測。
+  // 原本每幀重新比 Λ ≥ A，等於把它當成水位計 —— 已確認的手臂
+  // 壞一幀（Λ 掉到 −1.63）就失去身分，而快揮時的動態模糊正好
+  // 會造成那一幀，刀會在揮到一半時消失。
+  const track = { left: 0, right: 0 };
+  const confirmed = { left: false, right: false };
+  const boneMed = {};           // 骨頭名 → 長度中位數用的樣本
+  let stats = freshStats();
+
+  const gateMoving = () => ui.gate.checked;
+
+  function freshStats() {
+    return { frames:0, detFrames:0, fastSamples:0, fastDropouts:0, lrRejects:0,
+             maxSpeed:0, maxGap:0, bladeLen:0, forearm:0, hits:0, misses:0, bombs:0,
+             linkTries:0, linkOk:0, rejTime:0, rejRange:0, linSum:0, linN:0,
+             notSlashing:0, slashTests:0, strokeMax:0, maxGen:0, treasures:0,
+             sideFix:0, jumpGate:0, boneGate:0, armHidden:0, chainBroken:0,
+             comboMax:0, crits:0,
+             gapSum:0, gapN:0, infer:[], fpsTimes:[], inferTimes:[] };
+  }
+  // localStorage 在無痕視窗、擋第三方資料的設定下會直接丟錯，
+  // 不是回傳 null。讀寫都要包起來，沒有最高分也要能正常玩。
+  function loadBest() {
+    try { return parseInt(localStorage.getItem(BEST_KEY) || '0', 10) || 0; }
+    catch (e) { return 0; }
+  }
+  function saveBest(v) {
+    try { localStorage.setItem(BEST_KEY, String(v)); } catch (e) { /* 存不了就算了 */ }
+  }
+
+  function setStatus(msg, isErr) {
+    ui.status.textContent = msg || '';
+    ui.status.classList.toggle('err', !!isErr);
+  }
+
+  // ---- 相機 ----------------------------------------------------------------
+  async function startCamera() {
+    // getUserMedia 只在 secure context 下存在。用 file:// 開的話
+    // navigator.mediaDevices 整個是 undefined —— 不是權限被拒，是 API 不見了。
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('這個頁面要從 http://localhost 開才能用相機，直接用檔案路徑打開不行。');
+    }
+    // 重開相機前先把舊的收掉：不停的話舊 track 仍 live、舊的 rVFC 鏈
+    // 會繼續續接（它只看 video.srcObject）、舊 track 的 ended 監聽器
+    // 稍後還會把新的一局殺掉
+    if (video.srcObject) {
+      for (const t of video.srcObject.getTracks()) t.stop();
+      video.srcObject = null;
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width:{ideal:640}, height:{ideal:480}, facingMode:'user' }, audio:false });
+    // 相機被拔掉、或權限中途被撤銷時會觸發 ended。
+    // 但 Safari 在 USB 相機被拔掉時不發這個事件、readyState 甚至還說 live
+    // （WebKit bug 187896），所以另外還有一道看門狗在 renderLoop 裡。
+    for (const t of stream.getVideoTracks()) {
+      t.addEventListener('ended', () => cameraLost('相機斷了'));
+    }
+    video.srcObject = stream;
+    if (hasRVFC) {
+      // 續接的條件只能看「串流還在不在」。
+      //
+      // 原本寫 `if (running || phase !== 'idle')` —— 但這個函式是在
+      // startCamera() 裡呼叫的，那時候 running 還是 false、phase 還是 'idle'
+      // （要等模型載完才進 ready）。於是第一次回呼就不再續接，整條鏈當場死掉，
+      // 推論從此不再跑，畫面上的分數全是一張老影格。
+      const onFrame = (_t, meta) => {
+        if (lastPresented && meta.presentedFrames > lastPresented + 1) {
+          droppedFrames += meta.presentedFrames - lastPresented - 1;
+        }
+        lastPresented = meta.presentedFrames;
+        newFrame = true;
+        rvfcAt = performance.now();
+        if (video.srcObject) video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
+    }
+    await video.play();
+    if (!video.videoWidth) {
+      await new Promise((r) => video.addEventListener('loadedmetadata', r, { once:true }));
+    }
+    cv.width = video.videoWidth; cv.height = video.videoHeight;
+  }
+
+  function cameraLost(why) {
+    if (!running) return;
+    running = false;
+    hoverBtns = [];
+    clearFruits();
+    phase = 'idle'; demoMode = false;
+    if (video.srcObject) {
+      for (const t of video.srcObject.getTracks()) t.stop();
+      video.srcObject = null;
+    }
+    syncHint();   // 把提示框與按鈕叫回來，否則按鈕是 0×0
+    ui.start.disabled = false;
+    ui.start.textContent = '重新開啟相機';
+    setStatus(why + '。按畫面中央的按鈕再試一次。', true);
+  }
+
+  // ---- backend / 模型 ------------------------------------------------------
+  function probeBackends() {
+    // 只信 tfjs 真的註冊了的那些，不要信我以為載進來的那些。
+    const registered = Object.keys(tf.engine().registryFactory || {});
+    for (const opt of ui.backendSel.options) {
+      if (!registered.includes(opt.value) || (opt.value === 'webgpu' && !navigator.gpu)) {
+        opt.disabled = true;
+        opt.textContent = opt.textContent.replace(/（.*）$/, '') + '（這台不能用）';
+      }
+    }
+    if (ui.backendSel.selectedOptions[0] && ui.backendSel.selectedOptions[0].disabled) {
+      const ok = [...ui.backendSel.options].find((o) => !o.disabled);
+      if (ok) ui.backendSel.value = ok.value;
+    }
+  }
+
+  // MoveNet 沒有指節點，所以選它的時候「手腕→指節」這兩個選項要關掉，
+  // 而不是讓人選了之後在畫面上無聲失效。
+  function syncBladeOptions() {
+    const kind = MODELS[ui.model.value].kind;
+    for (const opt of ui.bladeSel.options) {
+      const needsKnuckle = opt.value === 'pinky' || opt.value === 'index';
+      opt.disabled = needsKnuckle && kind !== 'blazepose';   // palm/tip/wrist 兩種模型都有手腕與手肘
+    }
+    if (ui.bladeSel.selectedOptions[0] && ui.bladeSel.selectedOptions[0].disabled) {
+      ui.bladeSel.value = 'palm';
+      setStatus('這個模型沒有指節點，刀刃改用手腕往前 10cm。');
+    }
+  }
+
+  // 第一次推論要編譯 shader，會卡一下。模型是背景載入的，
+  // 正好在那時候先跑一次空推論，把這個停頓挪到玩家還沒開始之前。
+  async function warmup() {
+    try {
+      const c = document.createElement('canvas');
+      c.width = 256; c.height = 256;
+      const t0 = performance.now();
+      await detector.estimatePoses(c, { flipHorizontal: false });
+      warmupMs = Math.round(performance.now() - t0);
+    } catch (e) { /* 暖機失敗不影響正常運作 */ }
+  }
+
+  async function buildDetector() {
+    const want = ui.backendSel.value;
+    if (tf.getBackend() !== want) {
+      const ok = await tf.setBackend(want);
+      if (ok === false) throw new Error('這台切不到 ' + want + '，請在上面選別的運算方式。');
+    }
+    await tf.ready();
+    backendReady = true;
+    ui.backend.textContent = tf.getBackend();
+
+    if (detector) {
+      if (typeof detector.dispose === 'function') detector.dispose();
+      detector = null;
+    }
+    const key = ui.model.value;
+    const m = MODELS[key];
+    if (m.kind === 'movenet') {
+      const url = await localModelUrl(key);
+      const cfg = {
+        modelType: poseDetection.movenet.modelType[m.modelType],
+        enableSmoothing: ui.smooth.checked,
+        minPoseScore: 0.2,
+      };
+      if (url) cfg.modelUrl = url;
+      modelSource = url ? '本機' : 'CDN';
+      detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, cfg);
+      await warmup();
+    } else {
+      modelSource = 'CDN';
+      detector = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, {
+        runtime: 'tfjs',
+        modelType: m.modelType,
+        enableSmoothing: ui.smooth.checked,
+      });
+      await warmup();
+    }
+  }
+
+  // ---- 刀刃幾何 ------------------------------------------------------------
+  // 回傳 {bx,by, tx,ty}：刀柄（手腕）與刀尖。座標已經做過鏡像。
+  // 一整條手臂要三個點都夠可信才算「真的看到這隻手」。
+  // 只看手腕的話，垂下或出框的那隻手仍會被模型猜出一個位置、
+  // 偶爾越過門檻，就在畫面上生出一把到處游移的幽靈刀。
+  // 手腕是必要的 —— 沒有它就沒有刀。
+  // 手肘和肩膀只要有「一個」能用就好：手肘最準（掌刀本來就是從前臂算的），
+  // 肩膀次之，兩個都沒有就退化成只用手腕。
+  //
+  // 原本三個都強制要，結果坐在桌前、手肘出框時整隻手直接消失 ——
+  // 但那時候手明明看得見，掌刀少掉 10cm 的偏移頂多準度差一點，
+  // 比完全沒有刀好太多。
+  // 兩條手臂必須用到不同的點。
+  //
+  // chainOK 是各驗各的，所以兩條鏈可以各自「合法」卻用了幾乎同一組點 ——
+  // 單手舉起時模型會替另一隻手猜位置，猜的點常常疊在真手上，
+  // B 就用 A 的點拼出一條看似合法的鏈，一隻手長出兩把刀。
+  //
+  // 最強的訊號是肩膀：兩隻真手的手腕可以靠很近（雙手合十），
+  // 但兩個肩膀永遠不會重疊。肩膀疊在一起就表示模型根本沒在分左右。
+  function armsDistinct(kp) {
+    const sep = (a, b) => (a && b) ? Math.hypot(a.x - b.x, a.y - b.y) : Infinity;
+    const scale = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
+    if (sep(kp.left_shoulder, kp.right_shoulder) < scale * 0.5) return false;
+    if (sep(kp.left_wrist, kp.right_wrist) < scale * 0.45) return false;
+    if (sep(kp.left_elbow, kp.right_elbow) < scale * 0.45) return false;
+    return true;
+  }
+
+  // 這一側的三個關節，跟它自己上一次被信任的位置有多接近。
+  // 回傳 0..1，1 代表完全沒動，0 代表接不上（或根本沒有歷史）。
+  function continuity(side, kp, now) {
+    const h = chainHist[side];
+    if (!h || now - h.t > CHAIN_MEM_MS) return 0;
+    const scale = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
+    // 允許的位移隨經過時間放大，掉幀時才不會誤判成接不上
+    const budget = scale * CHAIN_MOVE * Math.max(1, (now - h.t) / 33);
+    let worst = 0;
+    for (const part of ARM) {
+      const k = kp[side + '_' + part], p = h[part];
+      if (!k || !p) return 0;
+      worst = Math.max(worst, Math.hypot(k.x - p.x, k.y - p.y));
+    }
+    return Math.max(0, 1 - worst / budget);
+  }
+
+  function rememberChain(side, kp, now) {
+    const rec = { t: now };
+    for (const part of ARM) {
+      const k = kp[side + '_' + part];
+      if (!k) { chainHist[side] = null; return; }
+      rec[part] = { x: k.x, y: k.y };
+    }
+    chainHist[side] = rec;
+  }
+
+  // 這一幀這一側的三項證據，累積成對數勝算比
+  function updateTracks(kp, now) {
+    for (const side of SIDES) {
+      const sh = kp[side + '_shoulder'], eb = kp[side + '_elbow'],
+            wr = kp[side + '_wrist'];
+      if (!sh || !eb || !wr) {
+        // 連三個點都湊不齊，直接往丟棄端推
+        track[side] = Math.max(SPRT_B, track[side] - 2);
+        latch(side);
+        if (!confirmed[side]) chainHist[side] = null;
+        continue;
+      }
+      const d = llr('chain',  chainOK(sh, eb, wr, shoulderWidth(kp)))
+              + llr('cont',   continuity(side, kp, now) > 0.25)
+              + llr('strong', wr.score >= MIN_SCORE * 1.5);
+      track[side] = Math.min(SPRT_A, Math.max(SPRT_B, track[side] + d));
+      latch(side);
+      if (!confirmed[side] && track[side] <= SPRT_B) chainHist[side] = null;
+      else rememberChain(side, kp, now);
+    }
+  }
+
+  // 鎖存：越過上界才確認，越過下界才撤銷，中間維持現狀
+  function latch(side) {
+    if (track[side] >= SPRT_A * 0.999) confirmed[side] = true;
+    else if (track[side] <= SPRT_B * 0.999) confirmed[side] = false;
+  }
+
+  const hasTrack = (side) => confirmed[side];
+
+  // 兩肩都看得到才有肩寬可用；只看得到一邊就回 0，那道檢查自動略過
+  function shoulderWidth(kp) {
+    const l = kp.left_shoulder, r = kp.right_shoulder;
+    if (!l || !r || l.score < MIN_SCORE || r.score < MIN_SCORE) return 0;
+    return Math.hypot(l.x - r.x, l.y - r.y);
+  }
+
+  // 這三點是不是同一隻手臂？
+  // 人的上臂與前臂長度相近，比例差太多就表示配錯了。
+  // 有校正值的話再多一道：前臂長度不該偏離量到的身形太多。
+  // 只檢查上界，不檢查下界。
+  //
+  // 透視投影只會讓線段「變短」，不會變長 —— 所以「太長」一定是配錯手臂，
+  // 但「太短」可能只是手伸直指向鏡頭。原本有三個下界檢查
+  // （upper<4、ratio 下限、fore/前臂 下限），手一伸直全部誤擋，
+  // 而那正是切水果最常用的動作。
+  //
+  // 擋掉錯配的工作改由上界 + armsDistinct（兩條鏈不能共用點）負責。
+  // 實測先前漏掉的「手肘是另一隻手的」案例（上臂 230px / 肩寬 120px = 1.9）
+  // 單靠上界就擋得下來。
+  function chainOK(sh, eb, wr, shoulderW) {
+    const upper = Math.hypot(sh.x - eb.x, sh.y - eb.y);
+    const fore  = Math.hypot(eb.x - wr.x, eb.y - wr.y);
+    // 只用「單一線段的絕對長度上界」。
+    //
+    // 不能用「前臂/上臂的比值」—— 投影會獨立影響兩段：手肘收在身側、
+    // 前臂橫向伸出時，上臂縮成 10px 而前臂 70px，比值 7.0，
+    // 但那是完全正常的姿勢。上界只對單一線段成立，對比值不成立。
+    if (shoulderW > 4 && upper / shoulderW > UPPER_VS_SHOULDER_HI) return false;
+    if (calib && calib.forearm > 4 && fore / calib.forearm > 2.2) return false;
+    return true;
+  }
+
+  // 手腕過不了就直接不用算了。
+  // 完整的條件是「肩肘腕三點成一條合理的鏈」，那由 bladeFor 的 chainOK 把關；
+  // 這裡只是提早退出，省掉後面的計算。
+  function armVisible(side, kp) {
+    const w = kp[side + '_wrist'];
+    if (!w || w.score < MIN_SCORE) { stats.armHidden++; return false; }
+    return true;
+  }
+
+  function bladeFor(side, kp, now) {
+    if (ui.stable.checked && !armVisible(side, kp)) return null;
+    const mirror = (k) => ({ x: cv.width - k.x, y: k.y, score: k.score });
+    const get = (n) => {
+      const k = kp[side + '_' + n];
+      const need = n === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE;
+      return k && k.score >= need ? mirror(k) : null;
+    };
+    const wrist = get('wrist');
+    if (!wrist) return null;
+
+    const mode = ui.bladeSel.value;
+    if (mode === 'palm' || mode === 'tip') {
+      // 手肘→手腕定出前臂方向，從手腕再往前走 K 倍前臂長。
+      // 前臂的像素長度本身就是尺度，所以這個距離會隨人站遠站近自動縮放。
+      const K = mode === 'palm' ? PALM_K : TIP_K;
+      const eb = get('elbow'), sh = get('shoulder');
+
+      // 方向只能從「驗證過的同一條手臂」來。
+      //
+      // 不要拿肩膀當替代方向來源 —— 單手舉起時模型對左右的標記不可靠，
+      // 很可能把這隻手的手腕配上另一邊的肩膀，算出一條橫跨身體的方向。
+      // 錯的方向比沒有方向糟糕得多：沒方向只是少 10cm 偏移，
+      // 錯方向會讓刀刃指到完全不相干的位置。
+      // 幾何過不了但接得上自己上一幀的鏈 → 仍然可信。
+      // 手往前伸是連續動作，中途某幾幀的幾何可能剛好落在邊界外，
+      // 不該因此整條鏈作廢。
+      // 軌跡沒站穩就不給刀 —— 幽靈手撐不過連續幾幀的確認
+      if (eb && sh && hasTrack(side)) {
+        const foreLen = Math.hypot(wrist.x - eb.x, wrist.y - eb.y);
+        stats.forearm = Math.max(stats.forearm, foreLen);
+
+        // 方向：前臂投影夠長就用前臂（最準）；手伸直朝向鏡頭時前臂縮成
+        // 幾個像素、方向全是雜訊，改用肩膀→手腕 —— 同一條已驗證的鏈，
+        // 基線長得多。（先前反對用肩膀，反對的是「配到另一隻手的肩膀」，
+        // 鏈驗證過之後就不是那個問題了。）
+        const ref = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
+        const useElbow = foreLen >= ref * DIR_MIN_FOREARM;
+        const ax = useElbow ? eb.x : sh.x, ay = useElbow ? eb.y : sh.y;
+        const len = Math.hypot(wrist.x - ax, wrist.y - ay) || 1;
+
+        // 位移量用「投影後的前臂長」而不是校正值 ——
+        // 手朝鏡頭時真實的 10cm 在畫面上本來就該縮短，縮到 0 是對的
+        const off = foreLen * K;
+        const x = wrist.x + (wrist.x - ax) / len * off;
+        const y = wrist.y + (wrist.y - ay) / len * off;
+        return { bx:x, by:y, tx:x, ty:y, pad: px(PALM_PAD) };
+      }
+      // 鏈不成立 → 沒有刀。不做「退化成手腕單點」。
+      //
+      // 鏈不成立時我們沒有任何證據說那個手腕是對的 ——
+      // 不是「位置對、只是少了方向」，而是「這個點可能根本不是手」。
+      // 模型對沒舉起來的那隻手也會猜一個手腕，猜的位置常落在真手旁邊，
+      // 一隻手就長出兩把刀。位置錯的刀比沒有刀糟得多：
+      // 會誤砍炸彈、斷連擊、讓整個遊戲看起來是隨機的。
+      stats.chainBroken++;
+      return null;
+    }
+    if (mode === 'wrist') {
+      // posenet_fruit_ninja（★45）就是只追手腕。刀刃退化成一個點，
+      // 留著當對照組 —— 它是這個題目裡唯一被多人玩過的做法。
+      return { bx: wrist.x, by: wrist.y, tx: wrist.x, ty: wrist.y };
+    }
+    if (mode === 'pinky' || mode === 'index') {
+      const knuckle = get(mode);
+      if (knuckle) {
+        // 指節到指尖還有一段，延長向量讓刀刃接近真實掌緣長度
+        return { bx: wrist.x, by: wrist.y,
+                 tx: wrist.x + (knuckle.x - wrist.x) * TIP_EXTEND,
+                 ty: wrist.y + (knuckle.y - wrist.y) * TIP_EXTEND };
+      }
+      // 指節掉了就退回外推，刀刃不要整個消失
+    }
+    const elbow = get('elbow');
+    // 手肘也掉了就退回手腕單點。刀刃退化成一個點還能玩，
+    // 整個回 null 就連刀痕都沒有了 —— 寧可退化不要消失。
+    if (!elbow) return { bx: wrist.x, by: wrist.y, tx: wrist.x, ty: wrist.y };
+    return { bx: wrist.x, by: wrist.y,
+             tx: wrist.x + (wrist.x - elbow.x) * EXTRAP_K,
+             ty: wrist.y + (wrist.y - elbow.y) * EXTRAP_K };
+  }
+
+  // 全最小平方直線擬合（垂直距離最小，不是 y 對 x 的回歸 —— 垂直刀痕
+  // 在後者會爆掉）。回傳線段兩端與直線度；直線度 1 = 完全共線。
+  function fitLine(pts) {
+    const n = pts.length;
+    if (n < 2) return null;
+    let mx = 0, my = 0;
+    for (const p of pts) { mx += p.x; my += p.y; }
+    mx /= n; my /= n;
+    let Sxx = 0, Syy = 0, Sxy = 0;
+    for (const p of pts) {
+      const dx = p.x - mx, dy = p.y - my;
+      Sxx += dx*dx; Syy += dy*dy; Sxy += dx*dy;
+    }
+    const th = 0.5 * Math.atan2(2*Sxy, Sxx - Syy);
+    const dx = Math.cos(th), dy = Math.sin(th);
+    let tmin = Infinity, tmax = -Infinity;
+    for (const p of pts) {
+      const t = (p.x - mx)*dx + (p.y - my)*dy;
+      if (t < tmin) tmin = t;
+      if (t > tmax) tmax = t;
+    }
+    // 兩個主成分的特徵值：差距越大越像一條線
+    const tr2 = Sxx + Syy;
+    const det = Math.sqrt((Sxx - Syy)*(Sxx - Syy) + 4*Sxy*Sxy);
+    const l1 = (tr2 + det) / 2, l2 = (tr2 - det) / 2;
+    const linearity = l1 > 1e-6 ? 1 - Math.max(0, l2) / l1 : 1;
+    return { x1: mx + dx*tmin, y1: my + dy*tmin,
+             x2: mx + dx*tmax, y2: my + dy*tmax, linearity, len: tmax - tmin };
+  }
+
+  // 軌跡尾端連續相連的那一段 —— 掉點造成的斷裂不要跨過去一起擬合
+  function activeRun(tr) {
+    if (tr.length < 2) return tr.slice();
+    let i = tr.length - 1;
+    while (i > 0 && tr[i].linked) i--;
+    return tr.slice(i);
+  }
+
+  // 每幀算一次，命中判定與繪製共用。
+  // 之前 testSlices 和 draw 各呼叫一次，fitLine 每幀跑 4 次，而且統計值會
+  // 從繪製路徑被更新 —— 等於「關掉繪製」就會改變量測結果。
+  const strokeCache = { left: null, right: null };
+  const strokeFor = (side) => strokeCache[side];
+
+  // 這隻手當下的刀痕：拉直成一條線段，或在它其實是弧線時維持原樣
+  function computeStroke(side) {
+    const run = activeRun(trails[side]);
+    if (run.length < 2) return null;
+    const fit = fitLine(run);
+    if (!fit) return null;
+    const straight = ui.straight.checked
+                  && fit.linearity >= MIN_LINEARITY
+                  && fit.len >= px(MIN_STROKE);
+    // 沒揮出一刀就不是刀。靜止的手不該因為水果飛過來就切到它。
+    const slashing = !gateMoving() || fit.len >= slashMinPx();
+    stats.strokeMax = Math.max(stats.strokeMax, fit.len);
+    stats.linSum += fit.linearity; stats.linN++;
+    return { run, fit, straight, slashing };
+  }
+
+  // ---- 自適應量（Tracked）--------------------------------------------------
+  //
+  // 會變的、不會變的、緩慢變的，用同一套機制：
+  //   滾動估計器（中位數之類的）＋ 帶遲滯的變化偵測。
+  // 差別只有「波動性」這一個參數：
+  //
+  //   static  身形這種不會變的 —— 收斂後鎖定。鎖定很重要，因為估計器的
+  //           輸入在遊戲進行中會被遊戲本身汙染（手一直在動，雜訊地板會
+  //           緩慢上爬），不鎖就會形成自己惡化的回饋迴路。
+  //   slow    光線這種會變但變得慢的 —— 持續跟，但要差夠多且持續夠久
+  //           才換值，否則門檻每幀亂飄，手感變得不可預測。
+  //   live    每幀都該更新的 —— 不做遲滯。
+  //
+  // 變化偵測用的是真正的兩側 CUSUM（Page, 1954）：
+  //
+  //   C⁺ᵢ = max(0, C⁺ᵢ₋₁ + (xᵢ − T) − K)
+  //   C⁻ᵢ = max(0, C⁻ᵢ₋₁ − (xᵢ − T) − K)
+  //   C 超過 H 就判定「真的變了」
+  //
+  // 為什麼不用「連續 N 次超出門檻」那種 run-length 規則：那個累積的是
+  // 次數，只要有一次落回帶內就整個歸零，所以帶雜訊的真實偏移可能永遠
+  // 累積不起來。CUSUM 累積的是偏離的「量」—— K 這個容忍量會把純雜訊
+  // 拉回 0（對雜訊記性短），但系統性偏差會一路累加（對持續偏移記性長），
+  // 而且偏移越大觸發越快，不像 run-length 不管多大都要等滿 N 次。
+  //
+  // 參數換算（慣例是 K = δ/2，δ 是想偵測的偏移量）：
+  //   以相對偏離 z = est/value − 1 為單位
+  //   K = band / 2
+  //   H = dwell × band / 2  →  剛好 band 大小的持續偏移會在 dwell 次後觸發，
+  //                            更大的偏移按比例更快
+  // 所以 band / dwell 這兩個旋鈕的意思不變，只是底下換成正確的演算法。
+
+  const median = (v) => {
+    if (!v.length) return 0;
+    const a = [...v].sort((x, y) => x - y);
+    return a[a.length >> 1];
+  };
+  const pctile = (v, q) => {
+    if (!v.length) return 0;
+    const a = [...v].sort((x, y) => x - y);
+    return a[Math.min(a.length - 1, Math.floor(q * a.length))];
+  };
+
+  function Tracked(opts) {
+    const o = Object.assign({
+      volatility: 'slow',
+      window: 150,        // 滾動視窗保留幾個樣本
+      full: 60,           // 樣本到這麼多就完全採信（之前跟預設值加權混合）
+      settle: 30,         // 連續穩定這麼多次才算定下來
+      tol: 0.03,          // 相鄰兩次估計差這麼少算穩定
+      band: 0.25,         // 偏離已定值這麼多算「真的變了」
+      dwell: 45,          // 而且要持續這麼多次
+      estimate: median,
+      fallback: 0,
+    }, opts);
+    const buf = [];
+    const K = o.band / 2;             // 容忍量：小於這個的偏離不累積
+    const H = o.dwell * o.band / 2;   // 決策界限
+    let value = o.fallback, settled = false, stable = 0, prev = 0;
+    let cHi = 0, cLo = 0;
+    return {
+      get value() { return value; },
+      get settled() { return settled; },
+      get n() { return buf.length; },
+      get weight() { return Math.min(1, buf.length / o.full); },
+      get raw() { return o.estimate(buf); },
+      // 目前累積了多少證據（0..1，1 就是即將觸發）。放進面板看得到變化在醞釀
+      get evidence() { return H ? Math.min(1, Math.max(cHi, cLo) / H) : 0; },
+      reset() {
+        buf.length = 0; value = o.fallback;
+        settled = false; stable = 0; prev = 0; cHi = 0; cLo = 0;
+      },
+      // 回傳 'settled' | 'changed' | undefined，讓呼叫端決定要不要通知使用者
+      push(v) {
+        buf.push(v);
+        if (buf.length > o.window) buf.shift();
+        const est = o.estimate(buf);
+
+        if (o.volatility === 'live') { value = est; return; }
+
+        if (settled) {
+          // 兩側 CUSUM，以相對偏離為單位
+          const z = value ? est / value - 1 : 0;
+          cHi = Math.max(0, cHi + z - K);
+          cLo = Math.max(0, cLo - z - K);
+          if (cHi > H || cLo > H) {
+            cHi = 0; cLo = 0;
+            if (o.volatility === 'static') { this.reset(); return 'changed'; }
+            value = est; return 'changed';     // slow：換到新值但不重來
+          }
+          return;
+        }
+
+        const w = this.weight;
+        value = o.fallback * (1 - w) + est * w;
+        const drift = prev ? Math.abs(est - prev) / Math.abs(prev) : 1;
+        prev = est;
+        stable = drift < o.tol ? stable + 1 : 0;
+        if (w >= 1 && stable >= o.settle) { settled = true; value = est; return 'settled'; }
+      },
+    };
+  }
+
+  // 三個量，三種波動性。預設值都用畫面比例，量到之後換成身體尺度。
+  const trk = {
+    forearm: Tracked({ volatility: 'static', fallback: 0 }),
+    // 雜訊地板取每幀位移的第 10 百分位 —— 不需要請人站著別動，
+    // 任何一段時間裡都有手比較靜的時刻，那些低位移就是雜訊
+    noise: Tracked({ volatility: 'static', fallback: 0,
+                     estimate: (v) => pctile(v, 0.10) }),
+    // 光線會變，所以這個要持續跟
+    score: Tracked({ volatility: 'slow', fallback: 0.6,
+                     band: 0.15, dwell: 60, settle: 30 }),
+  };
+
+  const autoScore = () => ui.scoreSel.value === 'auto';
+
+  function resetCalib() {
+    for (const k of Object.keys(trk)) trk[k].reset();
+    calib = null; calLast = null;
+  }
+
+  let calLast = null;
+
+  function feedCalib(kp) {
+    for (const side of SIDES) {
+      const e = kp[side + '_elbow'], w = kp[side + '_wrist'];
+      // 信心樣本要無條件收。
+      // 原本門檻設 0.25，但「光線差／框太近」正是拿不到 0.25 的時候 ——
+      // 要靠低信心才會啟動的自動放寬，卻用高信心當入場券，永遠跑不起來。
+      if (e) trk.score.push(e.score);
+      if (w) trk.score.push(w.score);
+      if (e && w && e.score >= 0.25 && w.score >= 0.25) {
+        const r = trk.forearm.push(Math.hypot(e.x - w.x, e.y - w.y));
+        if (r === 'changed') {
+          // 位置變了就連雜訊地板一起重量 —— 距離不同，雜訊的像素尺度也不同。
+          // 同時重開靜止窗，讓它有機會在新位置重新量一次。
+          trk.noise.reset(); calLast = null;
+          readyAt = performance.now();
+          setStatus('你的位置變了，重新量一次。');
+        }
+      }
+    }
+    // 雜訊只在「靜止窗」裡收：相機剛開、人還沒把手移到按鈕上的那幾秒。
+    // 那是真的靜止，量到的位移就是雜訊地板。
+    //
+    // 窗外不收是刻意的 —— 玩的時候手一直在動，繼續收只會把雜訊地板
+    // 一路推高、揮擊門檻跟著升、越玩越難切中。那是會自己惡化的迴路。
+    // 估計器仍用第 10 百分位，萬一這個人一開始就在動也擋得住。
+    const inRest = readyAt && performance.now() - readyAt < REST_MS;
+    if (inRest && !trk.forearm.settled) {
+      const w = kp.right_wrist || kp.left_wrist;
+      if (w && w.score >= 0.25) {
+        if (calLast) trk.noise.push(Math.hypot(w.x - calLast.x, w.y - calLast.y));
+        calLast = { x: w.x, y: w.y };
+      }
+    }
+    recalc();
+    adaptScore();
+  }
+
+  function recalc() {
+    if (!trk.forearm.n) { calib = null; return; }
+    const forearm = trk.forearm.value;
+    const noise = trk.noise.value;
+    const w = trk.forearm.weight;
+    const mix = (def, got) => def * (1 - w) + got * w;
+    calib = {
+      n: trk.forearm.n, w, forearm, noise,
+      locked: trk.forearm.settled,
+      score: trk.score.value,
+      slashMin: mix(px(F.slashMin),
+                    Math.max(forearm * SLASH_FOREARM, noise * SLASH_NOISE_MUL)),
+      maxSpeed: mix(px(MAX_JOINT_SPEED), forearm * SPEED_FOREARM),
+    };
+  }
+
+  // 光線差 → 整體信心下降 → 門檻跟著降，不然整條手臂會被判成不可信。
+  // 光線變好 → 門檻升回去，不然會把雜訊當成手。兩個方向都自動。
+  // 遲滯由 Tracked 的 band/dwell 負責，這裡只做對應。
+  function adaptScore() {
+    if (!autoScore() || trk.score.n < 20) return;
+    const target = Math.min(SCORE_MAX, Math.max(SCORE_MIN, trk.score.value * 0.5));
+    if (Math.abs(target - MIN_SCORE) < 0.005) return;
+    const was = MIN_SCORE;
+    MIN_SCORE = target;
+    if (Math.abs(target - was) >= 0.04) {
+      setStatus('光線變了，信心門檻自動從 ' + was.toFixed(2)
+        + ' 調到 ' + target.toFixed(2) + '。');
+    }
+  }
+
+  const slashMinPx = () => calib ? calib.slashMin : px(F.slashMin);
+  const maxSpeedPx = () => calib ? calib.maxSpeed : px(MAX_JOINT_SPEED);
+  const calibLockedNow = () => trk.forearm.settled;
+
+  // ---- 關節穩定化 ----------------------------------------------------------
+
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+  // 骨長的滾動中位數。用中位數不用平均，因為平均會被跳動本身拉走 ——
+  // 而我們正是要用這個值去判斷跳動。
+  function boneLength(name, v) {
+    const w = boneMed[name] || (boneMed[name] = []);
+    w.push(v);
+    if (w.length > 31) w.shift();
+    const srt = [...w].sort((a, b) => a - b);
+    return srt[srt.length >> 1];
+  }
+
+  // 1) 左右身分：模型會把左右手整個標反，造成點橫跨身體瞬移。
+  //    每幀試兩種指派，選跟上一幀最吻合的那個。
+  function fixSides(kp) {
+    // 用整條鏈比對，不是只看手腕。
+    // 只看手腕的話，「手腕標對但手肘標反」這種錯配偵測不到 ——
+    // 而那正是單手時最常發生的情形。
+    let keep = 0, swap = 0, n = 0;
+    for (const part of ARM) {
+      const pl = joint['left_' + part], pr = joint['right_' + part];
+      const cl = kp['left_' + part], cr = kp['right_' + part];
+      if (!pl || !pr || !cl || !cr) continue;
+      keep += dist(cl, pl) + dist(cr, pr);
+      swap += dist(cl, pr) + dist(cr, pl);
+      n++;
+    }
+    if (!n) return false;
+    // 要明顯比較好才換，不然兩邊差不多時會每幀來回跳
+    if (swap >= keep * SWAP_MARGIN) return false;
+    for (const part of ARM) {
+      const a = 'left_' + part, b = 'right_' + part;
+      const t = kp[a]; kp[a] = kp[b]; kp[b] = t;
+    }
+    stats.sideFix++;
+    return true;
+  }
+
+  // 2) 跳動閘門：單幀位移超過人類極限就丟掉這次偵測，沿用上一個。
+  //    但不能永遠擋 —— 人真的走到別處時要讓它跟上，所以有時限。
+  function gateJumps(kp, now) {
+    for (const side of SIDES) {
+      for (const part of ARM) {
+        const name = side + '_' + part;
+        const k = kp[name];
+        if (!k || k.score < MIN_SCORE) { delete joint[name]; continue; }
+        const p = joint[name];
+        if (p) {
+          const dt = Math.max((now - p.t) / 1000, 1e-3);
+          const speed = dist(k, p) / dt;
+          const held = p.heldSince ? now - p.heldSince : 0;
+          if (speed > maxSpeedPx() && held < HOLD_MAX_MS) {
+            kp[name] = { x: p.x, y: p.y, score: k.score, name };
+            p.heldSince = p.heldSince || now;
+            p.t = now;
+            stats.jumpGate++;
+            continue;
+          }
+        }
+        joint[name] = { x: k.x, y: k.y, t: now, heldSince: 0 };
+      }
+    }
+  }
+
+  // 3) 骨長合理性：上臂、前臂的長度不會突然變成兩倍。
+  //    會變就是末端那個點抓錯了，沿用上一個。
+  function gateBones(kp, now) {
+    for (const side of SIDES) {
+      for (const [a, b] of [['shoulder', 'elbow'], ['elbow', 'wrist']]) {
+        const ka = kp[side + '_' + a], kb = kp[side + '_' + b];
+        if (!ka || !kb) continue;
+        const name = side + '_' + a + '_' + b;
+        const len = dist(ka, kb);
+        const med = boneLength(name, len);
+        if (med > 4 && (len < med * BONE_LO || len > med * BONE_HI)) {
+          const p = joint[side + '_' + b];
+          if (p && now - (p.heldSince || now) < HOLD_MAX_MS) {
+            kp[side + '_' + b] = { x: p.x, y: p.y, score: kb.score, name: kb.name };
+            stats.boneGate++;
+          }
+        }
+      }
+    }
+  }
+
+  function stabilize(kp, now) {
+    if (!ui.stable.checked) return;
+    fixSides(kp);
+    gateJumps(kp, now);
+    gateBones(kp, now);
+  }
+
+  // ---- 懸停按鈕（Kinect 式）------------------------------------------------
+  //
+  // 把手停在按鈕上，圓圈走完一圈就觸發。體感遊戲沒有游標也沒有點擊，
+  // 懸停計時是唯一不需要額外手勢就能確認的方式。
+  //
+  // 注意：「開始」那一顆不能用這個 —— 相機還沒開就沒有手可以追，
+  // 而且瀏覽器規定相機權限與 AudioContext 都要由真實點擊觸發。
+  const DWELL_MS = 2000;    // 要停多久才算按下
+  const DWELL_DECAY = 2.5;  // 手離開後進度倒退的速度（倍率）
+  let hoverBtns = [];
+
+  function hoverPoints() {
+    const pts = [];
+    for (const side of SIDES) {
+      const tr = trails[side];
+      if (tr.length) pts.push(tr[tr.length - 1]);
+    }
+    return pts;
+  }
+
+  function stepHover(dt) {
+    const pts = hoverPoints();
+    for (const b of hoverBtns) {
+      const on = pts.some((p) => Math.hypot(p.x - b.x, p.y - b.y) <= b.r);
+      const was = b.dwell;
+      b.dwell = on
+        ? Math.min(1, b.dwell + dt * 1000 / DWELL_MS)
+        : Math.max(0, b.dwell - dt * DWELL_DECAY);
+      // 每走過 1/6 圈滴一聲，讓人知道系統有在讀他的動作
+      if (on && Math.floor(was * 6) !== Math.floor(b.dwell * 6)) sfx('tick');
+      if (b.dwell >= 1) {
+        b.dwell = 0;
+        sfx('confirm');
+        const fn = b.action;
+        hoverBtns = [];
+        fn();
+        return;
+      }
+    }
+  }
+
+  // 追蹤失靈、或手不方便舉的時候，滑鼠點圓圈也要能用。
+  // 體感是主要操作方式，但不該是唯一的。
+  cv.addEventListener('click', (ev) => {
+    if (!hoverBtns.length) return;
+    const r = cv.getBoundingClientRect();
+    const x = (ev.clientX - r.left) * (cv.width / r.width);
+    const y = (ev.clientY - r.top) * (cv.height / r.height);
+    for (const b of hoverBtns) {
+      if (Math.hypot(x - b.x, y - b.y) <= b.r) {
+        initAudio();
+        sfx('confirm');
+        const fn = b.action;
+        hoverBtns = [];
+        fn();
+        return;
+      }
+    }
+  });
+
+  // 選單狀態下要看得到手在哪，不然使用者不知道該往哪移動。
+  // 這個一定要畫在 drawGameOver / drawReady 的半透明遮罩「之後」，
+  // 不然會被蓋掉 —— 原本刀刃圓點就是畫在遮罩之前，所以看不見。
+  function drawHandCursor() {
+    const pts = hoverPoints();
+    if (!pts.length) {
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = '600 16px -apple-system,"PingFang TC",sans-serif';
+      ctx.fillText(framingHint(), cv.width / 2, cv.height * 0.84);
+      drawWhyNoArm(cv.height * 0.90);
+      return;
+    }
+    for (const p of pts) {
+      // 外圈用脈動的光暈，在暗色遮罩上才看得出來
+      const pulse = 1 + 0.12 * Math.sin(performance.now() / 260);
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.beginPath(); ctx.arc(0, 0, 26 * pulse, 0, 6.3);
+      ctx.fillStyle = 'rgba(96,165,250,.22)'; ctx.fill();
+      ctx.lineWidth = 2.5; ctx.strokeStyle = 'rgba(96,165,250,.95)'; ctx.stroke();
+      ctx.font = '26px serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('🖐', 0, 1);
+      ctx.restore();
+    }
+  }
+
+  // 得分與生命值。兩個都畫在 canvas 上 —— 之前得分是 HTML、生命值是 canvas，
+  // 兩套畫法混用，結果得分又小又暗，根本沒人注意到。
+  function drawHud(now) {
+    // 扣命的那一刻畫面邊緣閃紅。聲音可能被忽略，畫面不會。
+    const hurt = hurtAt ? 1 - Math.min(1, (now - hurtAt) / 500) : 0;
+    if (hurt > 0) {
+      const g = ctx.createRadialGradient(
+        cv.width/2, cv.height/2, Math.min(cv.width, cv.height) * 0.25,
+        cv.width/2, cv.height/2, Math.max(cv.width, cv.height) * 0.62);
+      g.addColorStop(0, 'rgba(248,113,113,0)');
+      g.addColorStop(1, 'rgba(248,113,113,' + (0.55 * hurt).toFixed(3) + ')');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = 'rgba(248,113,113,' + Math.min(1, hurt * 1.6).toFixed(2) + ')';
+      ctx.font = '700 26px -apple-system,"PingFang TC",sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(hurtWhy, cv.width / 2, cv.height * 0.20);
+    }
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,.85)'; ctx.shadowBlur = 8;
+
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillStyle = '#9aa3b2';
+    ctx.font = '600 13px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillText('分數', 16, 12);
+    ctx.fillStyle = now < doubleUntil ? '#fbbf24' : '#fff';
+    ctx.font = '700 40px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillText(String(score), 16, 28);
+
+    ctx.textAlign = 'right';
+    ctx.font = '24px serif';
+    let hearts = '';
+    for (let i = 0; i < LIVES; i++) hearts += i < lives ? '❤️' : '🖤';
+    // 剛扣命時愛心抖一下，視線在別處也會被餘光抓到
+    const shake = hurt > 0 ? Math.sin(now / 24) * 5 * hurt : 0;
+    ctx.fillText(hearts, cv.width - 14 + shake, 14);
+
+    // 生效中的寶物：顯示剩幾秒，不然不知道什麼時候會沒
+    let y = 50;
+    const badge = (icon, label, until) => {
+      const left = (until - now) / 1000;
+      if (left <= 0) return;
+      ctx.font = '600 14px -apple-system,"PingFang TC",sans-serif';
+      ctx.fillStyle = '#fbbf24';
+      ctx.fillText(icon + ' ' + label + ' ' + left.toFixed(1) + 's', cv.width - 14, y);
+      y += 22;
+    };
+    badge('⭐', '雙倍', doubleUntil);
+    badge('🍌', '慢動作', freezeUntil);
+
+    // 連擊：只在真的連起來時才出現，平常不要佔畫面
+    if (comboN >= 3 && now - comboAt < COMBO_WINDOW) {
+      const fade = 1 - (now - comboAt) / COMBO_WINDOW;
+      ctx.textAlign = 'center';
+      ctx.globalAlpha = Math.min(1, fade * 1.6);
+      ctx.fillStyle = '#67e8f9';
+      ctx.font = '700 34px -apple-system,"PingFang TC",sans-serif';
+      ctx.fillText(comboN + ' 連擊！', cv.width / 2, cv.height * 0.14);
+      ctx.font = '600 15px -apple-system,"PingFang TC",sans-serif';
+      ctx.fillText('×' + Math.min(comboN, COMBO_MAX), cv.width / 2, cv.height * 0.14 + 26);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  }
+
+  // 「偵測點不見了」最糟的回應是畫面什麼都不顯示 —— 使用者分不清是
+  // 自己沒站好、光線不夠、還是程式壞了。直接把每個關節的分數和門檻印出來。
+  // 「舉起手」不一定是對的建議。肩膀分數也偏低時，問題是整個人框太近、
+  // 身體被裁掉 —— MoveNet 是看較完整的人訓練出來的，這時候叫人舉手沒有用。
+  function framingHint() {
+    if (!lastPose) return '站到鏡頭前面，讓上半身進到畫面裡';
+    const kp = {};
+    for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
+    const sh = Math.max((kp.left_shoulder || {}).score || 0,
+                        (kp.right_shoulder || {}).score || 0);
+    const wr = Math.max((kp.left_wrist || {}).score || 0,
+                        (kp.right_wrist || {}).score || 0);
+    if (sh < 0.55) return '整個人離鏡頭太近了，退遠一點或把相機往後移';
+    if (wr < MIN_SCORE) return '舉起手，讓手掌進到畫面裡';
+    return '手肘最好也入鏡，掌刀會更準';
+  }
+
+  function drawWhyNoArm(y) {
+    if (!lastPose) {
+      ctx.fillStyle = '#9aa3b2';
+      ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+      ctx.fillText('完全沒偵測到人', cv.width / 2, y);
+      return;
+    }
+    const kp = {};
+    for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
+    const parts = [];
+    for (const side of SIDES) {
+      const bits2 = [];
+      for (const part of ARM) {
+        const k = kp[side + '_' + part];
+        const need = part === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE;
+        const sc = k ? k.score : 0;
+        bits2.push({ label: { shoulder:'肩', elbow:'肘', wrist:'腕' }[part],
+                     sc, ok: sc >= need });
+      }
+      parts.push({ side: side === 'left' ? '左' : '右', bits: bits2 });
+    }
+    ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+    let x = cv.width / 2 - 150;
+    for (const p of parts) {
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#9aa3b2';
+      ctx.fillText(p.side, x, y);
+      x += 18;
+      for (const b of p.bits) {
+        ctx.fillStyle = b.ok ? '#4ade80' : '#f87171';
+        ctx.fillText(b.label + ' ' + b.sc.toFixed(2), x, y);
+        x += 52;
+      }
+      x += 14;
+    }
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#9aa3b2';
+    ctx.fillText('門檻 ' + MIN_SCORE.toFixed(2)
+      + '　只有手腕是必要的，手肘／肩膀只影響準度',
+      cv.width / 2, y + 18);
+  }
+
+  // 把模型輸出的 17 個點原封不動畫出來 —— 不過門檻、不經穩定化。
+  // 「分數很低」和「位置找錯」是兩回事，光看分數分不出來；
+  // 把點畫在它實際落的地方，一眼就知道模型把人認在哪。
+  const SKELETON = [
+    ['left_shoulder','right_shoulder'],
+    ['left_shoulder','left_elbow'], ['left_elbow','left_wrist'],
+    ['right_shoulder','right_elbow'], ['right_elbow','right_wrist'],
+    ['left_shoulder','left_hip'], ['right_shoulder','right_hip'],
+    ['left_hip','right_hip'],
+    ['left_hip','left_knee'], ['left_knee','left_ankle'],
+    ['right_hip','right_knee'], ['right_knee','right_ankle'],
+  ];
+
+  function drawRawPose() {
+    if (!lastPose) {
+      ctx.fillStyle = '#f87171';
+      ctx.font = '600 15px -apple-system,"PingFang TC",sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('模型完全沒回傳姿勢', cv.width / 2, cv.height * 0.5);
+      return;
+    }
+    const kp = {};
+    for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
+    const X = (k) => cv.width - k.x;   // 畫面是鏡像的
+
+    ctx.lineWidth = 2;
+    for (const [a, b] of SKELETON) {
+      const ka = kp[a], kb = kp[b];
+      if (!ka || !kb) continue;
+      const w = Math.min(ka.score, kb.score);
+      ctx.strokeStyle = 'rgba(248,113,113,' + (0.15 + w * 0.7).toFixed(2) + ')';
+      ctx.beginPath(); ctx.moveTo(X(ka), ka.y); ctx.lineTo(X(kb), kb.y); ctx.stroke();
+    }
+    ctx.textAlign = 'left';
+    ctx.font = '600 10px ui-monospace,Menlo,monospace';
+    for (const k of lastPose.keypoints) {
+      if (!k.name) continue;
+      const x = X(k), y = k.y;
+      // 顏色代表分數：越綠越有信心
+      const g = Math.round(80 + k.score * 175);
+      ctx.fillStyle = `rgba(${Math.round(248 - k.score * 180)},${g},113,0.95)`;
+      ctx.beginPath(); ctx.arc(x, y, 3 + k.score * 4, 0, 6.3); ctx.fill();
+      ctx.fillText(k.score.toFixed(2), x + 7, y + 3);
+    }
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fbbf24';
+    ctx.font = '600 13px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillText('原始輸出（未過門檻）　整體分數 '
+      + (lastPose.score != null ? lastPose.score.toFixed(2) : '—'),
+      cv.width / 2, 18);
+  }
+
+  function drawHoverBtns() {
+    for (const b of hoverBtns) {
+      ctx.save();
+      ctx.translate(b.x, b.y);
+      const hot = b.dwell > 0;
+      ctx.beginPath(); ctx.arc(0, 0, b.r, 0, 6.3);
+      ctx.fillStyle = hot ? 'rgba(24,36,56,.9)' : 'rgba(16,20,28,.82)'; ctx.fill();
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = hot ? 'rgba(96,165,250,.45)' : 'rgba(255,255,255,.22)';
+      ctx.stroke();
+      if (b.dwell > 0) {
+        ctx.beginPath();
+        ctx.arc(0, 0, b.r, -Math.PI / 2, -Math.PI / 2 + b.dwell * Math.PI * 2);
+        ctx.lineWidth = 6; ctx.strokeStyle = '#60a5fa'; ctx.lineCap = 'round';
+        ctx.stroke();
+      }
+      ctx.fillStyle = '#e6e8ec';
+      ctx.font = '600 17px -apple-system,"PingFang TC",sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(b.label, 0, -7);
+      ctx.font = '400 11px -apple-system,"PingFang TC",sans-serif';
+      ctx.fillStyle = '#9aa3b2';
+      ctx.fillText('手停住，或用點的', 0, 13);
+      ctx.restore();
+    }
+  }
+
+  // ---- 音效 ----------------------------------------------------------------
+  //
+  // 全部用 Web Audio 合成，不帶任何音檔 —— 省掉素材、授權、載入時間。
+  //
+  // 自動播放政策：在使用者手勢之外建立的 AudioContext 會是 suspended，
+  // 而且 Safari/iOS 上在手勢外呼叫 resume() 會被「無聲忽略」—— 不報錯，
+  // 就是沒聲音。所以 AudioContext 只在「開始」按鈕的 click 處理器裡建立，
+  // 並掛一個一次性的 fallback，萬一第一次沒 resume 成功，之後任何點擊都能救回來。
+  let actx = null;
+
+  function initAudio() {
+    if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try { actx = new AC(); } catch (e) { return; }
+    actx.resume();
+    if (actx.state !== 'running') {
+      const retry = () => {
+        if (!actx) return;
+        actx.resume();
+        if (actx.state === 'running') {
+          document.removeEventListener('click', retry);
+          document.removeEventListener('touchstart', retry);
+        }
+      };
+      document.addEventListener('click', retry);
+      document.addEventListener('touchstart', retry);
+    }
+  }
+
+  // 一段帶包絡的白噪音，用來做「刷」的風聲與爆炸
+  function noiseBurst(dur, { type = 'bandpass', freq = 2000, q = 1, gain = 0.25,
+                             sweepTo = null } = {}) {
+    const n = Math.floor(actx.sampleRate * dur);
+    const buf = actx.createBuffer(1, n, actx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const src = actx.createBufferSource(); src.buffer = buf;
+    const flt = actx.createBiquadFilter();
+    flt.type = type; flt.frequency.value = freq; flt.Q.value = q;
+    if (sweepTo != null) {
+      flt.frequency.setValueAtTime(freq, actx.currentTime);
+      flt.frequency.exponentialRampToValueAtTime(sweepTo, actx.currentTime + dur);
+    }
+    const g = actx.createGain();
+    g.gain.setValueAtTime(gain, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+    src.connect(flt).connect(g).connect(actx.destination);
+    src.start();
+  }
+
+  function tone(freq, dur, { type = 'sine', gain = 0.2, to = null, delay = 0 } = {}) {
+    const t0 = actx.currentTime + delay;
+    const o = actx.createOscillator(); o.type = type;
+    o.frequency.setValueAtTime(freq, t0);
+    if (to != null) o.frequency.exponentialRampToValueAtTime(to, t0 + dur);
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(gain, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g).connect(actx.destination);
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  }
+
+  // 炸彈飛行中的引信聲。查到的原話是這個聲音「makes your stomach drop」——
+  // 我們原本只有炸到之後的爆炸聲，等於完全沒有事前警告。
+  function startFuse(seconds) {
+    if (!actx || actx.state !== 'running' || !ui.sound.checked) return null;
+    try {
+      const n = Math.floor(actx.sampleRate * seconds);
+      const buf = actx.createBuffer(1, n, actx.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1);
+      const src = actx.createBufferSource(); src.buffer = buf;
+      const flt = actx.createBiquadFilter();
+      flt.type = 'bandpass'; flt.frequency.value = 5200; flt.Q.value = 1.1;
+      const g = actx.createGain();
+      // 由小漸大，越接近越緊張
+      g.gain.setValueAtTime(0.001, actx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.05, actx.currentTime + seconds * 0.8);
+      g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + seconds);
+      src.connect(flt).connect(g).connect(actx.destination);
+      src.start();
+      return () => { try { src.stop(); } catch (e) { /* 已經停了 */ } };
+    } catch (e) { return null; }
+  }
+
+  function sfx(kind, arg) {
+    if (!actx || actx.state !== 'running' || !ui.sound.checked) return;
+    try {
+      if (kind === 'slice') {
+        const gen = arg || 0;   // 切得越細，聲音越輕越高
+        noiseBurst(0.11, { freq: 2600 + gen * 900, q: 0.9,
+                           gain: 0.22 * Math.pow(0.7, gen), sweepTo: 700 });
+        tone(300 + gen * 120, 0.09, { type: 'triangle', gain: 0.1 * Math.pow(0.7, gen) });
+      } else if (kind === 'bomb') {
+        noiseBurst(0.5, { type: 'lowpass', freq: 900, gain: 0.45, sweepTo: 90 });
+        tone(70, 0.4, { type: 'sawtooth', gain: 0.22, to: 32 });
+      } else if (kind === 'miss') {
+        tone(220, 0.16, { type: 'sine', gain: 0.14, to: 150 });
+      } else if (kind === 'over') {
+        [440, 350, 262, 196].forEach((f, i) =>
+          tone(f, 0.28, { type: 'triangle', gain: 0.18, delay: i * 0.14 }));
+      } else if (kind === 'crit') {
+        noiseBurst(0.13, { freq: 4200, q: 1.4, gain: 0.26, sweepTo: 900 });
+        tone(1320, 0.18, { type: 'triangle', gain: 0.2, to: 1760 });
+      } else if (kind === 'combo') {
+        // 連擊數越高音越高，耳朵自己會知道在累積
+        const n = Math.min(arg || 2, 8);
+        tone(440 * Math.pow(1.122, n * 2), 0.1, { type: 'square', gain: 0.09 });
+      } else if (kind === 'gem') {
+        [784, 1047, 1319].forEach((f, i) =>
+          tone(f, 0.16, { type: 'triangle', gain: 0.17, delay: i * 0.055 }));
+      } else if (kind === 'power') {
+        tone(523, 0.12, { type: 'square', gain: 0.1 });
+        tone(784, 0.2, { type: 'triangle', gain: 0.16, delay: 0.08, to: 1047 });
+      } else if (kind === 'tick') {
+        tone(1100, 0.04, { type: 'square', gain: 0.05 });
+      } else if (kind === 'confirm') {
+        tone(660, 0.1, { type: 'triangle', gain: 0.18 });
+        tone(990, 0.14, { type: 'triangle', gain: 0.16, delay: 0.08 });
+      }
+    } catch (e) { /* 聲音壞掉不該影響遊戲 */ }
+  }
+
+  // ---- 遊戲 ----------------------------------------------------------------
+  // 果汁顆粒需要顏色，emoji 本身取不到，所以一併列出來
+  const FRUIT = [
+    { ch:'🍉', color:'#f2415a' }, { ch:'🍊', color:'#ff9f2e' },
+    { ch:'🍋', color:'#ffd93d' }, { ch:'🍓', color:'#f2415a' },
+    { ch:'🥝', color:'#7ac74f' }, { ch:'🍎', color:'#e8453c' },
+  ];
+  const BOMB = { ch:'💣', color:'#8b8f99' };
+
+  // 寶物不會被切成兩半 —— 它們是「拿到」不是「切開」，
+  // 讓它們跟水果用不同的反應，玩家一眼就分得出發生了什麼事。
+  const TREASURE = {
+    gem:    { ch:'💎', color:'#67e8f9', p:0.06, label:'+5',    sound:'gem' },
+    双倍:   { ch:'⭐', color:'#fbbf24', p:0.04, label:'雙倍分數', sound:'power' },
+    freeze: { ch:'🍌', color:'#fde68a', p:0.04, label:'慢動作',  sound:'power' },
+    life:   { ch:'❤️', color:'#f87171', p:0.03, label:'+1 命',   sound:'power' },
+  };
+  const FREEZE_MS = 4500, DOUBLE_MS = 7000;
+
+  // 連擊：Fruit Ninja 的計分核心 —— 連續切中不失手，倍率往上爬。
+  // 視窗 1.1 秒取自 tubakhxn/Webcam-Fruit-Ninja 的 COMBO_WINDOW。
+  const COMBO_WINDOW = 1100, COMBO_MAX = 5;
+  const CRIT_P = 0.08, CRIT_BONUS = 10;
+
+  // ── 關節穩定化 ──
+  // 抖動（小幅高頻雜訊）交給 One Euro；這裡處理的是「跳動」——
+  // 整個點瞬間移到別的地方。那不是雜訊，是錯誤的偵測值，濾波治不了：
+  // 平滑一個錯誤的點只會得到一個平滑地移到錯誤位置的點。
+  //
+  // 人的手腕全力揮動大約 3–4 m/s。站 2.5 公尺、畫面寬約涵蓋 2 公尺時，
+  // 換算約 1300 px/秒。左右互換造成的跳動是「一幀之內橫跨身體」，
+  // 在 30fps 下等於 6000 px/秒以上 —— 兩者差了四倍以上，很好分。
+  const MAX_JOINT_SPEED = 3.0;   // 每秒幾個畫面寬，超過就當偵測錯誤
+  const HOLD_MAX_MS = 250;       // 連續擋這麼久就放行（人可能真的移動了）
+  const BONE_LO = 0.45, BONE_HI = 2.2;   // 骨長相對於中位數的可接受範圍
+  const SWAP_MARGIN = 0.6;       // 交換後要好這麼多才真的換，避免來回跳
+  const ARM = ['shoulder', 'elbow', 'wrist'];
+  // 掌刀 = 手腕 + 0.4 ×（手腕 − 手肘），所以手肘的誤差會被放大 0.4 倍帶進來。
+  // 手腕穩但手肘是低信心的猜測值時，看起來就是「手在跳」—— 實際上跳的是手肘。
+  // 所以手肘要比手腕更嚴。
+  // 手肘誤差會被掌刀算式放大，所以門檻比手腕嚴一點 —— 但只能一點。
+  // 原本 1.35 疊在校正之後會變成 0.47，整條手臂都過不了。
+  // 手肘的「穩定度」已經由跳動閘門在顧，這裡只需要擋掉明顯的亂猜。
+  const ELBOW_SCORE_MUL = 1.15;
+  // 肩→肘→腕必須是同一條鏈。人的前臂與上臂長度相近，
+  // 透視會讓比例偏離，但不會差到這個範圍外。
+  // 比例不合就表示這三點不是同一隻手臂（單手時模型常把左右配錯）。
+  // 上臂約 30cm、肩寬約 40cm。肩寬是當下這一幀就有的尺度參考，
+  // 不必等校正 —— 而且少了它，光靠「上臂/前臂比例」擋不住配錯的手肘：
+  // 錯配出來的鏈比例可能剛好落在合理範圍內，只有絕對尺度看得出不對。
+  const UPPER_VS_SHOULDER_HI = 1.5;
+  // 前臂投影短於這個比例時，拿它當方向來源不可靠（手伸直指向鏡頭的情形）
+  // —— 改用肩膀→手腕，同一條已驗證的鏈，基線長得多也穩得多
+  const DIR_MIN_FOREARM = 0.3;
+
+  // 手臂不會瞬移，也不會憑空出現。一條鏈該不該信，除了看它自己的幾何，
+  // 還要看它是不是上一幀的延續 —— 真手是連續動作的產物，
+  // 模型猜出來的幽靈手不是。
+  const CHAIN_MEM_MS = 700;    // 記得多久以前的鏈
+  const CHAIN_MOVE = 0.55;     // 每 33ms 每個關節最多移動幾倍前臂長
+
+  // 軌跡確認：序列機率比檢定（SPRT, Wald）。
+  //
+  // 這是資料關聯問題：真實世界有 1–2 隻手臂，模型每幀吐出 2 條標好左右的
+  // 鏈，要決定哪些是真的。每一幀是一次觀測，累積對數勝算比：
+  //
+  //   Λ ← Λ + log( P(觀測|真手) / P(觀測|幽靈) )
+  //   Λ ≥ A → 確認      A = log((1−β)/α)
+  //   Λ ≤ B → 丟棄      B = log(β/(1−α))
+  //
+  // 好處是門檻由「願意接受的錯誤率」推導，不是挑出來的：
+  //   α = 把幽靈當成真手的機率
+  //   β = 把真手當成幽靈的機率
+  // 而每一項證據的權重也不是選的，是該特徵在兩種假設下出現機率的比值。
+  //
+  // 這取代了先前的 +1/−1、門檻 3 計數器 —— 那其實是 SPRT 的退化版
+  // （二元證據、所有證據等權）。分級證據才用得到它的長處：
+  // 強確認的一幀抵得過兩幀勉強的，不必等滿固定幀數。
+  const SPRT_ALPHA = 0.01, SPRT_BETA = 0.05;
+  const SPRT_A = Math.log((1 - SPRT_BETA) / SPRT_ALPHA);   // ≈ +4.55
+  const SPRT_B = Math.log(SPRT_BETA / (1 - SPRT_ALPHA));   // ≈ −2.98
+
+  // 每一項證據：[P(出現|真手), P(出現|幽靈)]。
+  // 這些是假設，但是「可以討論的假設」—— 不像權重 1.5 無從檢驗。
+  const EV = {
+    chain:  [0.95, 0.30],   // 骨鏈幾何成立
+    cont:   [0.92, 0.15],   // 接得上自己上一幀（幽靈沒有穩定歷史）
+    strong: [0.80, 0.35],   // 手腕信心明顯高於門檻
+  };
+  const llr = (k, yes) => {
+    const [p1, p0] = EV[k];
+    return yes ? Math.log(p1 / p0) : Math.log((1 - p1) / (1 - p0));
+  };
+
+  // ── 校正 ──
+  // 原本所有門檻都是用「畫面寬的比例」表示的，那已經比寫死像素好，
+  // 但畫面寬跟「這個人的手臂有多長」沒有關係 —— 站遠一點、手臂短一點，
+  // 同一個比例的意義就完全不同。
+  // 開始前量三秒，把門檻換算成這個人自己的身體尺度。
+  // 不做「請站好三秒」那種阻斷式校正 —— 相機一開就持續量，
+  // 數值從預設值逐步收斂到量到的，使用者完全不用配合。
+  //
+  // 會變的、不會變的、緩慢變的，用同一套東西處理（見 Tracked）：
+  // 每個量都是「滾動估計器 + 帶遲滯的變化偵測」，差別只在波動性。
+  const SLASH_FOREARM = 1.0;   // 一刀至少要掃過一個前臂長
+  const SLASH_NOISE_MUL = 6;   // 而且至少要是雜訊地板的這麼多倍
+  const SPEED_FOREARM = 16;    // 手腕極速約 16 個前臂長／秒（≈4 m/s）
+  const SCORE_MIN = 0.12, SCORE_MAX = 0.32;
+  // 相機剛開、人還在看畫面的那幾秒，是真正的靜止窗 ——
+  // 他得先把手移到按鈕上才會開始動，所以這段時間量到的位移就是雜訊地板。
+  // 比「從長時間取第 10 百分位」直接得多，也快得多。
+  const REST_MS = 2500;
+
+  let bits  = [];    // 果汁顆粒
+  let marks = [];    // 切痕閃光 / 炸彈環
+  let pops  = [];    // 切中時往上飄的分數
+
+  // 每一塊果肉都帶著「自己被切過哪幾刀」的清單（本體座標系的角度 + 留哪一側）。
+  // 再切一刀就是複製成兩塊、各自多一個切面 —— 所以四分之一、八分之一都是
+  // 同一套邏輯，不用為「兩半」寫死一組特例。
+  const MAX_GEN   = 3;     // 最多切到八分之一，再細就看不出來也沒意義
+  const GEN_SHRINK = 0.72; // 每切一刀，命中半徑縮這麼多倍
+  const PIECE_IMMUNE_MS = 200;  // 碎塊剛生出來的無敵時間
+  const GEN_LABEL = ['—', '1/2', '1/4', '1/8'];
+
+  // 寶物是「拿到」不是「切開」：不分裂，改成一圈光環加文字
+  function takeTreasure(f, now) {
+    const t = TREASURE[f.treasure];
+    stats.treasures++;
+    sfx(t.sound);
+    marks.push({ kind: 'boom', x: f.x, y: f.y, t: now, R: f.R });
+    pops.push({ x: f.x, y: f.y, text: t.label, color: t.color, t: now });
+    for (let i = 0; i < 16; i++) {
+      const a = Math.random() * Math.PI * 2, v = px(0.1) + Math.random() * px(0.4);
+      bits.push({ x:f.x, y:f.y, vx:Math.cos(a)*v, vy:Math.sin(a)*v,
+                  r: 2 + Math.random()*3, color: t.color, t: now });
+    }
+    if (f.treasure === 'gem')        score += (now < doubleUntil ? 10 : 5);
+    else if (f.treasure === '双倍')  doubleUntil = now + DOUBLE_MS;
+    else if (f.treasure === 'freeze') freezeUntil = now + FREEZE_MS;
+    else if (f.treasure === 'life')  lives = Math.min(LIVES, lives + 1);
+  }
+
+  // why 會顯示在畫面上。扣命如果只有一聲低音，玩家不會知道發生了什麼 ——
+  // 這一局就是漏接漏到沒命，但使用者以為只有炸彈才會結束。
+  function loseLife(why) {
+    comboN = 0;
+    if (over) return;
+    lives--;
+    hurtAt = performance.now();
+    hurtWhy = why || '漏掉了';
+    if (lives > 0) { sfx('miss'); return; }
+    lives = 0; over = true;
+    overWhy = hurtWhy;
+    nextSpawn = Infinity;
+    if (score > best) { best = score; saveBest(best); }
+    sfx('over');
+    showGameOver();
+  }
+
+  function spawnDelay() { return Math.max(SPAWN_MS_MIN, SPAWN_MS_0 - SPAWN_ACCEL * score); }
+
+  function pickKind() {
+    // 炸彈從 3% 開始慢慢爬到 20%，不是一開始就 18%。
+    if (Math.random() < Math.min(BOMB_P_CAP, BOMB_P_0 + BOMB_P_GAIN * score)) {
+      return { kind: BOMB, bomb: true };
+    }
+    let r = Math.random();
+    for (const [key, t] of Object.entries(TREASURE)) {
+      // 命還是滿的時候不要掉愛心，那會讓人覺得遊戲在浪費機會
+      if (key === 'life' && lives >= LIVES) continue;
+      if (r < t.p) return { kind: t, treasure: key };
+      r -= t.p;
+    }
+    return { kind: FRUIT[Math.floor(Math.random() * FRUIT.length)] };
+  }
+
+  function spawn() {
+    const x = px(0.125) + Math.random() * (cv.width - px(0.25));
+    const { kind, bomb, treasure } = pickKind();
+    fruits.push({
+      x, y: cv.height + px(F.fruitR),
+      vx: (cv.width / 2 - x) * 0.45 + (Math.random() - 0.5) * 120,
+      vy: -(px(1.19) + Math.random() * px(0.41)),
+      ch: kind.ch, color: kind.color,
+      bomb: !!bomb, treasure: treasure || null,
+      dead: false, rot: 0, spin: (Math.random() - 0.5) * 4,
+      cuts: [], gen: 0, R: px(F.fruitR),
+      stopFuse: bomb ? startFuse(2.2) : null,
+    });
+  }
+
+  // 沒人的時候水果凍住，但果汁、閃光這些殘留特效要讓它們播完，
+  // 不然畫面會卡著一堆半透明的東西
+  function stepEffectsOnly(dt) {
+    const g = px(GRAVITY_F);
+    bits = bits.filter((b) => {
+      b.vy += g * dt; b.x += b.vx * dt; b.y += b.vy * dt;
+      return b.y < cv.height + 20 && performance.now() - b.t < 900;
+    });
+    marks = marks.filter((m) => performance.now() - m.t < (m.kind === 'boom' ? 420 : 200));
+    pops = pops.filter((p) => { p.y -= 46 * dt; return performance.now() - p.t < 700; });
+  }
+
+  function stepFruits(dt) {
+    // 慢動作只放慢水果，手的追蹤與刀痕維持原速 —— 不然會變成整個遊戲變鈍
+    if (performance.now() < freezeUntil) dt *= 0.42;
+    const g = px(GRAVITY_F);
+    const kept = [];
+    for (const f of fruits) {
+      if (f.dead) continue;   // 被切開的那塊由它的兩個子塊接手
+      f.vy += g * dt; f.x += f.vx * dt; f.y += f.vy * dt; f.rot += f.spin * dt;
+      if (f.y > cv.height + f.R * 3) {
+        if (f.stopFuse) { f.stopFuse(); f.stopFuse = null; }
+        // 只有完整的水果沒切到才算漏掉；碎塊落地是正常的
+        // 漏掉寶物只是可惜，不該扣命 —— 那是獎勵不是義務
+        // 漏接只計數、不扣命。
+        // 體感追蹤本來就會失誤，漏 3 顆就結束等於在處罰系統自己的問題 ——
+        // 實測一局 9 切 5 漏，命三顆根本撐不過開頭。只有炸彈扣命。
+        if (!f.bomb && !f.treasure && f.gen === 0) {
+          stats.misses++;
+          comboN = 0;   // 漏接仍然中斷連擊，那是技術問題不是處罰
+        }
+      } else kept.push(f);
+    }
+    fruits = kept;
+    bits = bits.filter((b) => {
+      b.vy += g * dt; b.x += b.vx * dt; b.y += b.vy * dt;
+      return b.y < cv.height + 20 && performance.now() - b.t < 900;
+    });
+    marks = marks.filter((m) => performance.now() - m.t < (m.kind === 'boom' ? 420 : 200));
+    pops = pops.filter((p) => { p.y -= 46 * dt; return performance.now() - p.t < 700; });
+  }
+
+  function segDist(px, py, ax, ay, bx, by) {
+    const dx = bx - ax, dy = by - ay, len2 = dx*dx + dy*dy;
+    if (len2 === 0) return Math.hypot(px - ax, py - ay);
+    let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    return Math.hypot(px - (ax + t*dx), py - (ay + t*dy));
+  }
+
+  // cutAngle 是刀痕在世界座標的角度，兩塊會沿它的法線分開
+  function hitFruit(f, cutAngle) {
+    f.dead = true;
+    if (f.stopFuse) { f.stopFuse(); f.stopFuse = null; }
+    const R = f.R;
+    const now = performance.now();
+
+    if (f.bomb) {
+      score = Math.max(0, score - 10); stats.bombs++;
+      sfx('bomb');
+      loseLife('砍到炸彈');
+      marks.push({ kind:'boom', x:f.x, y:f.y, t:now, R });
+      pops.push({ x: f.x, y: f.y, text: '−10', color: '#f87171', t: now });
+      for (let i = 0; i < 18; i++) {
+        const a = Math.random() * Math.PI * 2, v = px(0.12) + Math.random() * px(0.5);
+        bits.push({ x:f.x, y:f.y, vx:Math.cos(a)*v, vy:Math.sin(a)*v,
+                    r: 2 + Math.random()*3, color:'#ffb24d', t:now });
+      }
+      return;
+    }
+    if (f.treasure) { takeTreasure(f, now); return; }
+
+    stats.hits++;
+    if (now - comboAt > COMBO_WINDOW) comboN = 0;
+    comboN++; comboAt = now;
+    stats.comboMax = Math.max(stats.comboMax, comboN);
+
+    const mult = Math.min(comboN, COMBO_MAX);
+    const crit = Math.random() < CRIT_P;
+    let gained = mult * (now < doubleUntil ? 2 : 1);
+    if (crit) { gained += CRIT_BONUS; stats.crits++; }
+    score += gained;
+
+    sfx(crit ? 'crit' : 'slice', crit ? 0 : f.gen);
+    if (comboN >= 2) sfx('combo', comboN);
+    pops.push({ x: f.x, y: f.y, t: now, text: '+' + gained,
+                color: crit ? '#fbbf24' : (mult > 1 ? '#67e8f9' : '#e6e8ec') });
+    if (f.gen < MAX_GEN) stats.maxGen = Math.max(stats.maxGen, f.gen + 1);
+
+    marks.push({ kind:'cut', x:f.x, y:f.y, a:cutAngle, t:now, R });
+
+    // 果汁：切得越細噴得越少
+    const juice = Math.max(4, 12 - f.gen * 3);
+    for (let i = 0; i < juice; i++) {
+      const a = cutAngle + (Math.random() - 0.5) * 1.4 + (Math.random() < 0.5 ? 0 : Math.PI);
+      const v = px(0.1) + Math.random() * px(0.42);
+      bits.push({ x:f.x, y:f.y, vx:Math.cos(a)*v, vy:Math.sin(a)*v,
+                  r: 2 + Math.random()*3.5, color:f.color, t:now });
+    }
+
+    if (f.gen >= MAX_GEN) return;   // 再切下去已經看不出形狀
+
+    const nx = -Math.sin(cutAngle), ny = Math.cos(cutAngle);
+    const sep = (px(0.22) + Math.random() * px(0.1)) * Math.pow(0.8, f.gen);
+    for (const side of [1, -1]) {
+      fruits.push({
+        ch: f.ch, color: f.color, bomb: false, dead: false,
+        gen: f.gen + 1,
+        R: f.R * GEN_SHRINK,
+        // 切面角度存成「相對於果肉本體」，果肉翻滾時切面才會跟著轉
+        cuts: f.cuts.concat([{ a: cutAngle - f.rot, side }]),
+        x: f.x + nx * side * R * 0.12,
+        y: f.y + ny * side * R * 0.12,
+        vx: f.vx + nx * side * sep,
+        vy: Math.min(f.vy, -px(0.18)) + ny * side * sep,
+        rot: f.rot, spin: f.spin + side * (1.5 + Math.random() * 2),
+        // 剛生出來的碎塊先無敵一下，否則同一刀的同一條線段會立刻把它再切一次
+        born: now,
+      });
+    }
+  }
+
+  // 手刀是一條邊在空間裡掃過去。用三條線段近似那塊掃掠面積：
+  // 這一幀的刀身、刀尖的移動軌跡、刀柄的移動軌跡。
+  function testSlices() {
+    for (const side of SIDES) {
+      const tr = trails[side];
+      if (!tr.length) continue;
+      stats.slashTests++;
+      const st = strokeFor(side);
+      if (st && !st.slashing) { stats.notSlashing++; continue; }
+      const pad = tr[tr.length - 1].pad || 0;
+      const segs = [];
+
+      if (st && st.straight) {
+        // 拉直模式：命中判定也用那一條擬合線。
+        // 這同時修掉折線的一個副作用 —— 鋸齒狀的小段會從水果旁邊「繞過去」，
+        // 明明揮過了卻沒切到。一條直線不會有這個問題。
+        segs.push([st.fit.x1, st.fit.y1, st.fit.x2, st.fit.y2]);
+      } else if (st) {
+        for (let i = 1; i < st.run.length; i++) {
+          segs.push([st.run[i-1].x, st.run[i-1].y, st.run[i].x, st.run[i].y]);
+        }
+      }
+      // 刀身（手腕→刀刃）同樣只在揮的時候算
+      const bs = bases[side];
+      if (bs.length && st && st.slashing) {
+        const t = tr[tr.length-1], b = bs[bs.length-1];
+        if (Math.hypot(t.x - b.x, t.y - b.y) > 1) segs.push([b.x, b.y, t.x, t.y]);
+      }
+
+      const now = performance.now();
+      for (const f of fruits) {
+        if (f.dead) continue;
+        // 剛被切出來的碎塊先無敵一下。不然同一刀的同一條線段下一幀還在，
+        // 會把它一路切到最細，玩家只感覺到「碰一下就碎光了」。
+        if (f.born && now - f.born < PIECE_IMMUNE_MS) continue;
+        // 已經切到最細就切不動了。讓它繼續飛，不要一碰就蒸發。
+        if (f.gen >= MAX_GEN) continue;
+        for (const g of segs) {
+          if (segDist(f.x, f.y, g[0], g[1], g[2], g[3]) < f.R + pad) {
+            hitFruit(f, Math.atan2(g[3] - g[1], g[2] - g[0]));
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // ---- 兩個獨立迴圈 --------------------------------------------------------
+  //
+  // 重點：rAF 的回呼必須是同步的。
+  // 原本 `await estimatePoses` 就寫在 rAF 回呼裡，瀏覽器要等整個 async
+  // 函式走完才能畫下一幀 —— 於是遊戲幀率被綁死在推論速度上，推論 30ms
+  // 就只能 33fps。把 await 移出 rAF 之後，GPU 在算的時候瀏覽器照樣能畫，
+  // 推論掉到 20fps 畫面仍然是 60fps。
+
+  // 把一次推論結果吃進軌跡裡
+  function showStartBtn() {
+    hoverBtns = [{ x: cv.width / 2, y: cv.height * 0.58,
+                   r: Math.min(78, cv.width * 0.12),
+                   label: '開始', dwell: 0, action: beginPlay }];
+  }
+
+  function ingestPose(pose, now) {
+    lastPose = pose;
+    const kp = {};
+    if (pose) for (const k of pose.keypoints) if (k.name) kp[k.name] = k;
+
+    // 先把關節點穩住，再去算刀刃 —— 肩、肘、腕三個點一起修，
+    // 不然掌刀是從抓錯的手肘算出來的，怎麼平滑都沒用。
+    stabilize(kp, now);
+    feedCalib(kp);
+
+    // 先決定哪幾隻手臂可用，再去算刀刃。
+    // 兩邊的點重疊時，弱的那一邊直接從 kp 裡拿掉 ——
+    // 不能只是「不給它刀」，要讓它完全沒機會沾到另一邊的點。
+    // 先更新軌跡信用，再決定重疊時留誰
+    updateTracks(kp, now);
+
+    if (!armsDistinct(kp)) {
+      // 信用高的留下。信用相同才比手腕分數。
+      let weak;
+      if (Math.abs(track.left - track.right) > 0.01) {
+        weak = track.left > track.right ? 'right' : 'left';
+      } else {
+        const sl = (kp.left_wrist  && kp.left_wrist.score)  || 0;
+        const sr = (kp.right_wrist && kp.right_wrist.score) || 0;
+        weak = sl >= sr ? 'right' : 'left';
+      }
+      for (const part of ARM) delete kp[weak + '_' + part];
+      chainHist[weak] = null;
+      track[weak] = SPRT_B; confirmed[weak] = false;
+      stats.lrRejects++;
+    }
+
+    const blades = { left: bladeFor('left', kp, now), right: bladeFor('right', kp, now) };
+
+    // 左右手混淆保護：模型在雙手交叉或重疊時會把左右互換，
+    // 那會產生一條橫跨畫面的假刀痕、憑空切掉一排水果。
+    // （posenet_fruit_ninja 用 leftRightMiniDistance 做同一件事。）
+    if (blades.left && blades.right) {
+      const apart = Math.hypot(blades.left.tx - blades.right.tx,
+                               blades.left.ty - blades.right.ty);
+      // 有量到身形就用身體尺度：兩隻手的掌刀不會靠得比一個前臂長還近
+      const near = calib && calib.forearm > 4
+        ? Math.max(px(F.lrMin), calib.forearm * 1.1) : px(F.lrMin);
+      if (apart < near) {
+        // 優先留「骨鏈成立」的那一隻 —— 鏈成立代表肩肘腕三點自洽，
+        // 比單看手腕分數可靠得多。兩邊同樣時才比分數。
+        const sl = (kp.left_wrist  && kp.left_wrist.score)  || 0;
+        const sr = (kp.right_wrist && kp.right_wrist.score) || 0;
+        // 到這裡兩邊都是鏈成立的刀（鏈不成立的在 bladeFor 就被擋掉了），
+        // 所以比手腕分數就好
+        if (sl >= sr) blades.right = null; else blades.left = null;
+        stats.lrRejects++;
+      }
+    }
+
+    let any = false;
+    for (const side of SIDES) {
+      const b = blades[side];
+      const p = prev[side];
+      if (b) {
+        any = true;
+        stats.bladeLen = Math.max(stats.bladeLen, Math.hypot(b.tx - b.bx, b.ty - b.by));
+        let linked = false, fast = false, moving = false;
+        if (p) {
+          const dtp = Math.max((now - p.t) / 1000, 1e-3);
+          const dist = Math.hypot(b.tx - p.tx, b.ty - p.ty);
+          const speed = dist / dtp;
+          stats.maxSpeed = Math.max(stats.maxSpeed, speed);
+          stats.maxGap = Math.max(stats.maxGap, dist);
+          fast = speed > px(F.fastSpeed);
+          if (fast) stats.fastSamples++;
+          moving = speed >= px(F.moveSpeed);
+          const inTime = (now - p.t) <= MAX_LINK_MS;
+          const inRange = dist <= px(F.maxLink);
+          linked = inTime && inRange;
+          // 分別記下是哪一道關卡擋掉的，才不用再猜
+          stats.linkTries++;
+          if (!inTime) stats.rejTime++;
+          if (!inRange) stats.rejRange++;
+          if (linked) stats.linkOk++;
+          stats.gapSum += dist; stats.gapN++;
+        }
+        trails[side].push({ x:b.tx, y:b.ty, t:now, linked, moving, pad: b.pad || 0 });
+        bases[side].push({ x:b.bx, y:b.by, t:now, linked, moving });
+        prev[side] = { tx:b.tx, ty:b.ty, t:now, fast };
+      } else {
+        // 上一幀正在快揮、這一幀抓不到 → 動態模糊掉點的特徵
+        if (p && p.fast) stats.fastDropouts++;
+        prev[side] = null;
+      }
+    }
+    if (any) { stats.detFrames++; lastBladeAt = now; }
+  }
+
+  // 推論迴圈：唯一會 await 的地方，不在 rAF 裡
+  // MoveNet 內部會把輸入縮到 192×192，但 640×480 的材質上傳成本還在。
+  // 先縮小再送進去「可能」比較快 —— 但 drawImage 本身也要錢，
+  // 所以做成開關去量，不要憑感覺決定。
+  function inferInput() {
+    if (!ui.small.checked) return { src: video, scale: 1 };
+    const W = 256;
+    const H = Math.round(W * video.videoHeight / video.videoWidth) || 192;
+    if (!small) { small = document.createElement('canvas'); }
+    if (small.width !== W || small.height !== H) { small.width = W; small.height = H; }
+    small.getContext('2d').drawImage(video, 0, 0, W, H);
+    return { src: small, scale: video.videoWidth / W };
+  }
+
+  async function inferLoop(token) {
+    if (!running || token !== loopToken) return;
+    let didWork = false;
+    // rVFC 若超過半秒沒動靜就不要再信它，退回輪詢。
+    // 推論整個停擺是最糟的失敗模式 —— 畫面還在動，數字還在更新，
+    // 但全部是舊的，從外面完全看不出來。寧可多一道保險。
+    const rvfcOK = hasRVFC && rvfcAt && performance.now() - rvfcAt < 500;
+    const fresh = rvfcOK ? newFrame : (video.currentTime !== lastVideoTime);
+    if (detector && video.readyState >= 2 && fresh) {
+      newFrame = false;
+      lastVideoTime = video.currentTime;
+      didWork = true;
+      const t0 = performance.now();
+      let poses = [];
+      const inp = inferInput();
+      try {
+        poses = await detector.estimatePoses(inp.src, { flipHorizontal: false });
+        // 縮過圖的話，關節點座標是在縮圖的尺度上，要放大回原本的畫面
+        if (inp.scale !== 1 && poses[0]) {
+          for (const k of poses[0].keypoints) { k.x *= inp.scale; k.y *= inp.scale; }
+        }
+      } catch (e) { setStatus('推論失敗：' + e.message, true); }
+      const now = performance.now();
+      stats.infer.push(now - t0);
+      if (stats.infer.length > 180) stats.infer.shift();
+      stats.frames++;
+      stats.inferTimes.push(now);
+      while (stats.inferTimes.length && now - stats.inferTimes[0] > 1000) stats.inferTimes.shift();
+      try {
+        ingestPose(poses[0] || null, now);
+      } catch (e) { setStatus('處理姿勢失敗：' + e.message, true); }
+    }
+    // 交回主執行緒讓 rAF 有機會跑。沒事做時隔久一點，不要空轉。
+    setTimeout(() => inferLoop(token), didWork ? 0 : 16);
+  }
+
+  // 繪製迴圈：全同步，絕不 await
+  function renderLoop(token) {
+    if (!running || token !== loopToken) return;
+    const now = performance.now();
+    const dt = lastT ? Math.min((now - lastT) / 1000, 0.05) : 0.016;
+    lastT = now;
+
+    // 看門狗：影格時間停止前進就代表相機其實已經斷了。
+    // 這是給 Safari 用的 —— 它拔掉相機時不發 ended、readyState 還報 live。
+    if (video.readyState >= 2) {
+      if (video.currentTime !== lastFrameTime) {
+        lastFrameTime = video.currentTime; lastFrameAt = now;
+      } else if (lastFrameAt && now - lastFrameAt > 2500) {
+        cameraLost('相機沒有畫面了');
+        return;
+      }
+    }
+
+    // 分頁切到背景時 rAF 會被節流，回來那一瞬間 dt 會暴衝、水果直接穿過畫面。
+    // 乾脆暫停，回來再繼續。
+    if (paused) {
+      draw(now);
+      requestAnimationFrame(() => renderLoop(token));
+      return;
+    }
+
+    // 沒人就整個停住 —— 不生水果、不跑物理、不判命中。
+    // 原本只延後生成，但已經在空中的水果照樣落下、照樣算漏接，
+    // 畫面上也沒有任何表示，看起來就像遊戲自己在玩。
+    // lastBladeAt 為 0 代表「從來沒看到過人」—— 那正是最該暫停的情況，
+    // 不是例外。原本寫 `&& !!lastBladeAt` 把語意弄反了，結果永遠不觸發。
+    lostPerson = phase === 'playing' && !demoMode
+                 && (now - lastBladeAt > NO_PERSON_MS);
+
+    for (const side of SIDES) {
+      trails[side] = trails[side].filter((p) => now - p.t <= TRAIL_MS);
+      bases[side]  = bases[side].filter((p) => now - p.t <= TRAIL_MS);
+    }
+    for (const side of SIDES) strokeCache[side] = computeStroke(side);
+
+    if (!lostPerson) {
+      if (phase === 'playing' && now >= nextSpawn) { spawn(); nextSpawn = now + spawnDelay(); }
+      stepFruits(dt);
+      if (!over) testSlices();
+    } else {
+      // 停住時只讓特效跑完，水果凍在原地等人回來
+      stepEffectsOnly(dt);
+    }
+    stepHover(dt);
+    draw(now);
+
+    stats.fpsTimes.push(now);
+    while (stats.fpsTimes.length && now - stats.fpsTimes[0] > 1000) stats.fpsTimes.shift();
+    // 面板只是顯示用的，不該讓它的錯誤中斷下一幀的排程。
+    try {
+      updatePanel();
+    } catch (e) {
+      if (!panelBroken) {
+        panelBroken = true;
+        setStatus('量測面板出錯，遊戲繼續：' + e.message, true);
+      }
+    }
+    requestAnimationFrame(() => renderLoop(token));
+  }
+
+  function startLoops() {
+    const token = ++loopToken;   // 讓前一輪的迴圈退場
+    lastT = 0;
+    requestAnimationFrame(() => renderLoop(token));
+    inferLoop(token);
+  }
+
+  function draw(now) {
+    if (video.readyState >= 2) {
+      ctx.save();
+      ctx.translate(cv.width, 0); ctx.scale(-1, 1);   // 鏡像，讓人像照鏡子
+      ctx.drawImage(video, 0, 0, cv.width, cv.height);
+      ctx.restore();
+    } else {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, cv.width, cv.height);
+    }
+    ctx.fillStyle = 'rgba(8,10,14,.42)';
+    ctx.fillRect(0, 0, cv.width, cv.height);
+
+    if (ui.skel.checked && lastPose) {
+      // 只畫手臂。這個遊戲只用到肩、肘、腕，
+      // 臉上那些點畫出來只是雜訊，還會擋住自己的臉。
+      const kp = {};
+      for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
+      // 只連「相鄰」的兩個關節，而且兩端都要過門檻。
+      //
+      // 原本是先用 filter 把低分的點濾掉、再把剩下的依序連起來 ——
+      // 手肘沒過門檻時那會畫出一條「肩膀→手腕」的直線，
+      // 看起來像三點一線成立了，實際上根本不是解剖學上的鏈。
+      ctx.lineWidth = 3;
+      const sw = shoulderWidth(kp);
+      for (const side of SIDES) {
+        const sh = kp[side + '_shoulder'], eb = kp[side + '_elbow'],
+              wr = kp[side + '_wrist'];
+        const ok = (k, part) => k && k.score >=
+          (part === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE);
+        const shOK = ok(sh, 'shoulder'), ebOK = ok(eb, 'elbow'), wrOK = ok(wr, 'wrist');
+        // 整條鏈成立（會用來算掌刀方向）→ 綠色；否則藍色，代表只能退化成單點
+        const full = shOK && ebOK && wrOK && chainOK(sh, eb, wr, sw);
+        const col = full ? '76,222,128' : '96,165,250';
+        ctx.strokeStyle = 'rgba(' + col + ',.65)';
+        ctx.fillStyle = 'rgba(' + col + ',.9)';
+        const link = (a, b, aOK, bOK) => {
+          if (!aOK || !bOK) return;
+          ctx.beginPath();
+          ctx.moveTo(cv.width - a.x, a.y); ctx.lineTo(cv.width - b.x, b.y); ctx.stroke();
+        };
+        link(sh, eb, shOK, ebOK);
+        link(eb, wr, ebOK, wrOK);
+        for (const [k, good] of [[sh, shOK], [eb, ebOK], [wr, wrOK]]) {
+          if (!good) continue;
+          ctx.beginPath(); ctx.arc(cv.width - k.x, k.y, 4, 0, 6.3); ctx.fill();
+        }
+      }
+    }
+
+    ctx.font = (px(F.fruitR) * 1.8) + 'px serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    // 每一塊都是「同一個 emoji，被它自己那串切面裁過」。
+    // 連續 clip() 會取交集，所以切兩刀自然得到四分之一、三刀得到八分之一。
+    // 裁切框跟著果肉一起翻滾，切面方向看起來就固定在果肉上。
+    for (const f of fruits) {
+      ctx.save();
+      ctx.translate(f.x, f.y);
+      ctx.rotate(f.rot);
+      if (f.cuts.length) {
+        const B = px(F.fruitR) * 3;   // 夠大就好，蓋得住整顆
+        for (const c of f.cuts) {
+          ctx.rotate(c.a);
+          ctx.beginPath();
+          ctx.rect(-B, c.side > 0 ? 0 : -B, B * 2, B);
+          ctx.clip();
+          ctx.rotate(-c.a);
+        }
+      }
+      ctx.fillText(f.ch, 0, 0);
+      ctx.restore();
+    }
+
+    // 果汁
+    for (const b of bits) {
+      const age = (now - b.t) / 900;
+      ctx.globalAlpha = Math.max(0, 1 - age);
+      ctx.fillStyle = b.color;
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 6.3); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // 切中時浮出來的分數
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (const p of pops) {
+      const age = (now - p.t) / 700;
+      ctx.globalAlpha = Math.max(0, 1 - age * age);
+      ctx.fillStyle = p.color;
+      ctx.font = '700 ' + (22 + 8 * (1 - age)) + 'px -apple-system,sans-serif';
+      ctx.fillText(p.text, p.x, p.y);
+    }
+    ctx.globalAlpha = 1;
+
+    // 切痕閃光與炸彈環
+    for (const m of marks) {
+      if (m.kind === 'cut') {
+        const age = (now - m.t) / 200;
+        ctx.save(); ctx.translate(m.x, m.y); ctx.rotate(m.a);
+        ctx.globalAlpha = Math.max(0, 1 - age);
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 3 * (1 - age) + 1;
+        ctx.beginPath();
+        ctx.moveTo(-m.R * 1.5, 0); ctx.lineTo(m.R * 1.5, 0); ctx.stroke();
+        ctx.restore();
+      } else {
+        const age = (now - m.t) / 420;
+        ctx.globalAlpha = Math.max(0, 1 - age);
+        ctx.strokeStyle = '#ffb24d'; ctx.lineWidth = 6 * (1 - age) + 1;
+        ctx.beginPath();
+        ctx.arc(m.x, m.y, m.R * (0.5 + age * 2.4), 0, 6.3); ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    ctx.lineCap = 'round';
+    for (const side of SIDES) {
+      const tr = trails[side], bs = bases[side];
+      const st = strokeFor(side);
+      // 只有真的算一刀的時候才畫刀痕。
+      // 畫了卻切不到會讓人以為是判定失靈，而不是自己揮得不夠。
+      if (st && st.slashing) {
+        if (st.straight) {
+          // 一條直線，粗細從頭到尾漸變，看起來像一刀劃過
+          const grad = ctx.createLinearGradient(st.fit.x1, st.fit.y1, st.fit.x2, st.fit.y2);
+          grad.addColorStop(0, 'rgba(255,255,255,0.05)');
+          grad.addColorStop(0.65, 'rgba(255,255,255,0.85)');
+          grad.addColorStop(1, 'rgba(255,255,255,0.98)');
+          ctx.strokeStyle = grad; ctx.lineWidth = 9;
+          ctx.beginPath();
+          ctx.moveTo(st.fit.x1, st.fit.y1); ctx.lineTo(st.fit.x2, st.fit.y2); ctx.stroke();
+        } else {
+          // 擬合殘差太大 → 這是一道弧，照原樣畫不要硬拉直
+          for (let i = 1; i < st.run.length; i++) {
+            const age = (now - st.run[i].t) / TRAIL_MS;
+            ctx.strokeStyle = 'rgba(255,255,255,' + (0.9 * (1 - age)).toFixed(3) + ')';
+            ctx.lineWidth = 9 * (1 - age) + 2;
+            ctx.beginPath();
+            ctx.moveTo(st.run[i-1].x, st.run[i-1].y);
+            ctx.lineTo(st.run[i].x, st.run[i].y); ctx.stroke();
+          }
+        }
+      }
+      // 刀身：這一幀的手腕→刀刃，畫出來才看得出掌刀的位置
+      if (tr.length && bs.length) {
+        const t = tr[tr.length-1], b = bs[bs.length-1];
+        if (Math.hypot(t.x - b.x, t.y - b.y) > 1) {
+          ctx.strokeStyle = 'rgba(96,165,250,.9)'; ctx.lineWidth = 5;
+          ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(t.x, t.y); ctx.stroke();
+        }
+        ctx.fillStyle = 'rgba(96,165,250,.95)';
+        ctx.beginPath(); ctx.arc(t.x, t.y, 6, 0, 6.3); ctx.fill();
+      }
+    }
+    drawHud(now);
+
+    if (lostPerson) {
+      ctx.fillStyle = 'rgba(8,10,14,.6)'; ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = '700 26px -apple-system,"PingFang TC",sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('看不到你，先暫停', cv.width / 2, cv.height * 0.42);
+      ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';
+      ctx.fillStyle = '#9aa3b2';
+      ctx.fillText('回到畫面裡就會繼續，水果和分數都留著',
+                   cv.width / 2, cv.height * 0.42 + 30);
+      drawWhyNoArm(cv.height * 0.42 + 64);
+    } else if (paused) {
+      ctx.fillStyle = 'rgba(8,10,14,.72)'; ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.fillStyle = '#e6e8ec';
+      ctx.font = '600 22px -apple-system,"PingFang TC",sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('暫停中，切回這個分頁就繼續', cv.width / 2, cv.height / 2);
+    } else if (phase === 'over') drawGameOver();
+    else if (phase === 'ready') drawReady();
+    drawHoverBtns();
+    // 手的位置永遠畫在最上層。選單狀態下要指引，遊戲中抓不到手時
+    // 也要讓人知道「系統現在看不到你」而不是默默沒反應。
+    if (ui.raw.checked) drawRawPose();
+    if (hoverBtns.length) drawHandCursor();
+    else if (phase === 'playing' && !hoverPoints().length) drawWhyNoArm(cv.height * 0.93);
+  }
+
+  // ---- 面板 ----------------------------------------------------------------
+  const pct = (n, d) => d ? ((n/d)*100).toFixed(1) + '%' : '—';
+  function q(arr, p) {
+    if (!arr.length) return null;
+    const s = [...arr].sort((a,b) => a-b);
+    return s[Math.min(s.length-1, Math.floor(p * s.length))];
+  }
+  function tint(node, v, goodBelow, badAbove) {
+    node.classList.remove('good','warn','bad');
+    if (v == null) return;
+    node.classList.add(v <= goodBelow ? 'good' : v >= badAbove ? 'bad' : 'warn');
+  }
+
+  function updatePanel() {
+    const fps = stats.fpsTimes.length;
+    ui.fps.textContent = fps + ' /秒';
+    tint(ui.fps, -fps, -30, -20);
+    // 這兩個數字現在是獨立的。解耦生效的話，推論掉下去畫面仍該維持住。
+    const ifps = stats.inferTimes.length;
+    ui.ifps.textContent = ifps + ' /秒';
+    tint(ui.ifps, -ifps, -20, -10);
+    ui.camDrop.textContent = hasRVFC ? String(droppedFrames) : '（不支援偵測）';
+    ui.warm.textContent = warmupMs ? warmupMs + ' ms' : '—';
+
+    const p50 = q(stats.infer, .5), p95 = q(stats.infer, .95);
+    ui.p50.textContent = p50 == null ? '—' : p50.toFixed(1) + ' ms';
+    ui.p95.textContent = p95 == null ? '—' : p95.toFixed(1) + ' ms';
+    tint(ui.p50, p50, 15, 33); tint(ui.p95, p95, 25, 50);
+
+    ui.det.textContent = pct(stats.detFrames, stats.frames);
+    const den = stats.fastSamples + stats.fastDropouts;
+    ui.drop.textContent = pct(stats.fastDropouts, den);
+    tint(ui.drop, den ? stats.fastDropouts/den : null, .05, .2);
+
+    ui.blade.textContent = stats.bladeLen ? Math.round(stats.bladeLen) + ' px' : '—';
+    ui.forearm.textContent = calib
+      ? Math.round(calib.forearm) + ' px（'
+        + (calibLockedNow() ? '已鎖定' : Math.round(calib.w * 100) + '%') + '）' : '—';
+    ui.noise.textContent = calib ? calib.noise.toFixed(1) + ' px/幀' : '—';
+    ui.ms.textContent = MIN_SCORE.toFixed(2)
+      + (autoScore() ? '（自動）' : '（固定）');
+    ui.cusum.textContent = trk.forearm.settled
+      ? Math.round(trk.forearm.evidence * 100) + '%' : '—';
+    ui.speed.textContent = stats.maxSpeed ? Math.round(stats.maxSpeed) + ' px/秒' : '—';
+    ui.gap.textContent   = stats.maxGap ? Math.round(stats.maxGap) + ' px' : '—';
+    ui.hit.textContent = stats.hits; ui.miss.textContent = stats.misses;
+    ui.bomb.textContent = stats.bombs;
+    ui.tre.textContent = stats.treasures;
+    ui.combo.textContent = stats.comboMax;
+    ui.crit.textContent = stats.crits;
+    ui.jump.textContent = stats.jumpGate;
+    ui.bone.textContent = stats.boneGate;
+    ui.side.textContent = stats.sideFix;
+    ui.arm.textContent  = stats.armHidden;
+    ui.chain.textContent = stats.chainBroken;
+    ui.track.textContent =
+      track.left.toFixed(1) + (confirmed.left ? '✓' : '') + ' / ' +
+      track.right.toFixed(1) + (confirmed.right ? '✓' : '') +
+      '（' + SPRT_B.toFixed(1) + ' … ' + SPRT_A.toFixed(1) + '）';
+    ui.state.textContent = lostPerson ? '沒看到人（暫停）'
+      : paused ? '分頁在背景' : demoMode ? phase + '（示範）' : phase;
+    // 兩隻手各自的鏈現在成不成立，一眼看出是哪一邊有問題
+    if (lastPose) {
+      const kp = {};
+      for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
+      const sw = shoulderWidth(kp);
+      const mark = (side) => {
+        const sh = kp[side + '_shoulder'], eb = kp[side + '_elbow'],
+              wr = kp[side + '_wrist'];
+        if (!wr || wr.score < MIN_SCORE) return '無手腕';
+        if (!sh || !eb || sh.score < MIN_SCORE
+            || eb.score < MIN_SCORE * ELBOW_SCORE_MUL) return '只有腕';
+        return chainOK(sh, eb, wr, sw) ? '成立' : '不合理';
+      };
+      ui.chain2.textContent = mark('left') + ' / ' + mark('right');
+    }
+    ui.lr.textContent = stats.lrRejects;
+
+    const T = stats.linkTries;
+    ui.link.textContent     = pct(stats.linkOk, T);
+    tint(ui.link, T ? -(stats.linkOk / T) : null, -0.5, -0.15);
+    ui.rejMove.textContent  = pct(stats.notSlashing, stats.slashTests);
+    ui.gen.textContent = GEN_LABEL[stats.maxGen] || '—';
+    ui.stroke.textContent   = stats.strokeMax
+      ? Math.round(stats.strokeMax) + ' px（門檻 ' + Math.round(slashMinPx()) + '）' : '—';
+    ui.rejTime.textContent  = pct(stats.rejTime, T);
+    ui.rejRange.textContent = pct(stats.rejRange, T);
+    ui.gapAvg.textContent   = stats.gapN
+      ? (stats.gapSum / stats.gapN).toFixed(1) + ' px' : '—';
+    const lin = stats.linN ? stats.linSum / stats.linN : null;
+    ui.lin.textContent = lin == null ? '—' : lin.toFixed(3);
+    tint(ui.lin, lin == null ? null : -lin, -MIN_LINEARITY, -0.94);
+    // 還沒初始化任何 backend 時 tf.memory() 會丟錯
+    // （載了 webgpu 之後它是最高優先的 backend，但尚未 init）
+    ui.src.textContent = modelSource;
+    ui.tensors.textContent = backendReady ? tf.memory().numTensors : '—';
+  }
+
+  // ---- 控制 ----------------------------------------------------------------
+  // 一次把水果清乾淨，連引信一起停。原本停引信的迴圈寫在 fruits = []
+  // 之後，永遠跑 0 圈 —— 炸彈從畫面消失，嘶嘶聲繼續響到 buffer 播完。
+  function clearFruits() {
+    for (const f of fruits) if (f.stopFuse) f.stopFuse();
+    fruits = [];
+  }
+
+  // 只負責歸零量測與遊戲狀態，不碰 phase、不碰 hoverBtns。
+  // 原本它把 phase 推到 'ready' 卻沒重建「開始」圓圈，而唯一的
+  // 「開啟相機」按鈕在 .hint 裡、phase !== 'idle' 時整個隱藏 ——
+  // 五個入口（歸零重測／四個 select）全都會卡進「有畫面、沒有任何可按的東西」。
+  function clearRuntime() {
+    stats = freshStats(); clearFruits(); bits = []; marks = []; pops = []; score = 0;
+    lives = LIVES; over = false; ui.again.hidden = true; hoverBtns = [];
+    freezeUntil = 0; doubleUntil = 0; comboN = 0;
+    lastBladeAt = 0; lostPerson = false; demoMode = false;
+    track.left = 0; track.right = 0;
+    confirmed.left = false; confirmed.right = false;
+    chainHist.left = null; chainHist.right = null;
+    strokeCache.left = null; strokeCache.right = null;
+    for (const s of SIDES) { trails[s] = []; bases[s] = []; prev[s] = null; }
+  }
+
+  ui.start.addEventListener('click', async () => {
+    ui.start.disabled = true;
+    ui.start.textContent = '開啟相機';
+    lastFrameAt = 0; lastFrameTime = -1;
+    initAudio();   // 一定要在這個 click 處理器裡建立，不然 Safari 會無聲
+    setStatus('正在開相機…');
+    try {
+      // 相機一好就讓畫面動起來，不要壓在模型載入後面。
+      // 模型冷啟要幾秒，這段時間使用者只看得到提示框，會以為當掉了。
+      await startCamera();
+      clearRuntime(); running = true; lastVideoTime = -1;
+      phase = 'ready'; syncHint();   // 相機一好就把提示框收起來，先讓人看到自己
+      nextSpawn = Infinity;   // 模型還沒好就先不要丟水果，不然會白白算成漏接
+      startLoops();
+      setStatus('相機好了，正在載入模型…');
+
+      await buildDetector();
+      ui.reset.disabled = false;
+      enterReady();
+    } catch (e) {
+      ui.start.disabled = false;
+      setStatus(e.message || String(e), true);
+    }
+  });
+
+  // 不需要相機就能看到切半特效，也讓這條繪製路徑在交付前真的被跑過一次
+  ui.demo.addEventListener('click', () => {
+    initAudio();   // 這也是真實點擊，可以解鎖音訊
+    const now = performance.now();
+    // 畫面上還有可切的碎塊就再切一刀，沒有才生一顆新的。
+    // 這樣連按就會看到 整顆 → 兩半 → 四分之一 → 八分之一。
+    const live = fruits.filter((f) => !f.dead && !f.bomb && f.gen < MAX_GEN
+                                   && (!f.born || now - f.born >= PIECE_IMMUNE_MS)
+                                   && f.y > 0 && f.y < cv.height);
+    if (live.length) {
+      const a = Math.random() * Math.PI;
+      for (const f of live) hitFruit(f, a);
+      setStatus('再切一刀：現在最細是 '
+        + ['—','1/2','1/4','1/8'][Math.min(3, stats.maxGen)] + '。');
+    } else {
+      const kind = FRUIT[Math.floor(Math.random() * FRUIT.length)];
+      const f = {
+        x: cv.width / 2, y: cv.height / 2, vx: 0, vy: -px(0.1),
+        ch: kind.ch, color: kind.color,
+        bomb: false, dead: false, rot: 0.3, spin: 1.2,
+        cuts: [], gen: 0, R: px(F.fruitR),
+      };
+      fruits.push(f);
+      hitFruit(f, 0.5);
+      setStatus('切成兩半了。再按一次會把兩半各自再切開。');
+    }
+    // 示範不要借用 phase。原本從 idle 直接推成 'playing'，
+    // syncHint() 會因此把提示框藏起來 —— 唯一的「開啟相機」按鈕就在裡面，
+    // 按一次示範就永久失去開相機的能力。
+    demoMode = true;
+    if (!running) { running = true; startLoops(); }
+  });
+
+  // 量化到底傷了多少，只有用真人影像量才算數。
+  // 合成的假人連基準模型自己都認不出來，拿那種輸入比等於在比雜訊。
+  ui.cmp.addEventListener('click', async () => {
+    if (!video.videoWidth) { setStatus('要先按「開始」把相機打開。', true); return; }
+    ui.cmp.disabled = true;
+    const ARM = ['left_shoulder','right_shoulder','left_elbow','right_elbow',
+                 'left_wrist','right_wrist'];
+    let a = null, b = null;
+    try {
+      setStatus('載入兩個模型…');
+      const mk = (url) => poseDetection.createDetector(
+        poseDetection.SupportedModels.MoveNet,
+        { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+          modelUrl: url, enableSmoothing: false, minPoseScore: 0.2 });
+      a = await mk('models/movenet-lightning/model.json');
+      b = await mk('models/movenet-lightning-uint8/model.json');
+
+      const dArm = [], dAll = [], sA = [], sB = [];
+      let frames = 0, missA = 0, missB = 0;
+      const until = performance.now() + 5000;
+      setStatus('揮動手臂五秒，正在比對…');
+      while (performance.now() < until) {
+        const pa = (await a.estimatePoses(video, { flipHorizontal:false }))[0];
+        const pb = (await b.estimatePoses(video, { flipHorizontal:false }))[0];
+        frames++;
+        if (!pa) { missA++; }
+        if (!pb) { missB++; }
+        if (!pa || !pb) continue;
+        for (let i = 0; i < pa.keypoints.length; i++) {
+          const ka = pa.keypoints[i], kb = pb.keypoints[i];
+          const d = Math.hypot(ka.x - kb.x, ka.y - kb.y);
+          dAll.push(d);
+          if (ARM.includes(ka.name)) { dArm.push(d); sA.push(ka.score); sB.push(kb.score); }
+        }
+      }
+      const srt = (v) => [...v].sort((x,y)=>x-y);
+      const q = (v,p) => v.length ? srt(v)[Math.floor(v.length*p)] : NaN;
+      const avg = (v) => v.length ? v.reduce((s,n)=>s+n,0)/v.length : NaN;
+
+      if (!dArm.length) {
+        showResult([['有效幀', '0']],
+          '五秒內都沒同時抓到兩邊的手臂。站進畫面、讓手肘也入鏡，再按一次。');
+        setStatus('沒量到東西，再試一次。', true);
+        return;
+      }
+
+      const medArm = q(dArm, 0.5), p95Arm = q(dArm, 0.95);
+      const cA = avg(sA), cB = avg(sB);
+      const lostA = missA / frames, lostB = missB / frames;
+
+      // 判讀基準：掌刀是從手腕和手肘算出來的，誤差會被放大 1.4 倍，
+      // 而命中半徑約 41.6px。所以關節點差 5px → 刀刃差 7px，
+      // 只佔命中半徑的 17%，切不切得到不會變；差 15px 就開始有感。
+      let verdict, tone;
+      if (lostB > lostA + 0.15) {
+        verdict = 'uint8 掉追蹤的機率明顯比較高（' + (lostA*100).toFixed(0) + '% → '
+          + (lostB*100).toFixed(0) + '%）。這比位置誤差更傷，建議留在 fp16。';
+        tone = 'bad';
+      } else if (medArm < 5) {
+        verdict = '手臂關節點中位只差 ' + medArm.toFixed(1)
+          + 'px，換算到刀刃約 ' + (medArm*1.4).toFixed(1)
+          + 'px，不到命中半徑的兩成 —— 玩起來不會有差別。可以用 uint8。';
+        tone = 'good';
+      } else if (medArm < 15) {
+        verdict = '中位差 ' + medArm.toFixed(1) + 'px、p95 差 ' + p95Arm.toFixed(1)
+          + 'px。多半感覺不出來，但快揮時的刀痕會比較不穩。想省體積就用，'
+          + '想要最穩就留 fp16。';
+        tone = 'warn';
+      } else {
+        verdict = '中位就差 ' + medArm.toFixed(1) + 'px，換算到刀刃約 '
+          + (medArm*1.4).toFixed(1) + 'px，接近命中半徑的一半 —— '
+          + '會切不準。建議留在 fp16。';
+        tone = 'bad';
+      }
+
+      showResult([
+        ['比對幀數',          String(frames)],
+        ['手臂關節點差 中位', medArm.toFixed(1) + ' px'],
+        ['手臂關節點差 p95',  p95Arm.toFixed(1) + ' px'],
+        ['全部關節點差 中位', q(dAll,0.5).toFixed(1) + ' px'],
+        ['手臂信心 fp16',     cA.toFixed(3)],
+        ['手臂信心 uint8',    cB.toFixed(3)],
+        ['抓不到的幀 fp16',   (lostA*100).toFixed(0) + '%'],
+        ['抓不到的幀 uint8',  (lostB*100).toFixed(0) + '%'],
+      ], verdict, tone);
+      setStatus('比對完成，結果在下面。');
+    } catch (e) {
+      setStatus('比對失敗：' + e.message, true);
+    } finally {
+      if (a && a.dispose) a.dispose();
+      if (b && b.dispose) b.dispose();
+      ui.cmp.disabled = false;
+    }
+  });
+
+  // 看得到自己、但遊戲還沒開始。站好位置，再把手停到圓圈上。
+  // 提示框只在還沒開相機時出現。散在各條路徑裡手動開關，
+  // 遲早會有一條忘記關 —— 示範按鈕那條就忘了，結果提示蓋在結束畫面上。
+  // 提示框（連同「開啟相機」按鈕）只要相機還沒跑起來就該在。
+  // 不能只看 phase —— 示範模式與相機斷線都會讓 phase 不是 idle，
+  // 但那兩種情形使用者正需要那顆按鈕。
+  function syncHint() {
+    ui.hint.hidden = !!(video.srcObject && phase !== 'idle');
+  }
+
+  // 歸零之後要把該有的互動補回去 —— 這是 clearRuntime 不碰 phase 的配套
+  function reenter() {
+    clearRuntime();
+    if (phase === 'over') showGameOver();
+    else if (phase !== 'idle') enterReady();
+    syncHint();
+  }
+
+  function enterReady() {
+    phase = 'ready';
+    readyAt = performance.now();
+    over = false;
+    lives = LIVES;
+    syncHint();
+    fruits = []; bits = []; marks = []; pops = [];
+    nextSpawn = Infinity;
+    ui.again.hidden = true;
+    showStartBtn();   // 不用等校正，校正是背景持續在跑的
+    setStatus('把手停在圓圈上就開始。站位會自己量，不用配合做什麼。');
+  }
+
+  function drawReady() {
+    ctx.fillStyle = 'rgba(8,10,14,.5)';
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#e6e8ec';
+    ctx.font = '600 22px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillText('把手停在圓圈上', cv.width / 2, cv.height * 0.30);
+
+    ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillStyle = '#9aa3b2';
+    if (!calib) {
+      ctx.fillText('確認肩膀、手肘、手腕都在畫面裡', cv.width / 2, cv.height * 0.30 + 30);
+      return;
+    }
+    ctx.fillText('前臂 ' + Math.round(calib.forearm) + 'px　揮擊門檻 '
+      + Math.round(calib.slashMin) + 'px', cv.width / 2, cv.height * 0.30 + 30);
+    // 校正收斂進度。不擋人開始，只是讓他知道數字還在調
+    const bw = cv.width * 0.28, bx = (cv.width - bw) / 2, by = cv.height * 0.30 + 50;
+    ctx.fillStyle = 'rgba(255,255,255,.15)'; ctx.fillRect(bx, by, bw, 4);
+    ctx.fillStyle = calibLockedNow() ? '#4ade80' : '#60a5fa';
+    ctx.fillRect(bx, by, bw * (calibLockedNow() ? 1 : calib.w), 4);
+    ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillStyle = calibLockedNow() ? '#4ade80' : '#9aa3b2';
+    ctx.fillText(calibLockedNow() ? '已依你的身形校正' : '校正中…', cv.width / 2, by + 20);
+  }
+
+  function beginPlay() {
+    phase = 'playing';
+    over = false;
+    lives = LIVES;
+    score = 0;
+    freezeUntil = 0; doubleUntil = 0; comboN = 0;
+    hurtAt = 0; hurtWhy = ''; overWhy = '';
+    syncHint();
+    fruits = []; bits = []; marks = []; pops = [];
+    hoverBtns = [];
+    ui.again.hidden = true;
+    nextSpawn = performance.now() + 600;   // 給一點反應時間再丟第一顆
+    lastBladeAt = performance.now();       // 剛開始先當作有人，不要立刻判定離開
+    lostPerson = false; demoMode = false;
+    setStatus('揮動手臂切水果，避開炸彈。');
+  }
+
+  function showGameOver() {
+    phase = 'over';
+    syncHint();
+    ui.again.hidden = false;
+    hoverBtns = [{ x: cv.width / 2, y: cv.height * 0.62, r: Math.min(76, cv.width * 0.12),
+                   label: '再玩一次', dwell: 0, action: restart }];
+    setStatus('把手停在圓圈上，圈走完一輪就重新開始。');
+  }
+
+  function drawGameOver() {
+    ctx.fillStyle = 'rgba(8,10,14,.72)';
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#e6e8ec';
+    ctx.font = '700 44px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillText('得分 ' + score, cv.width / 2, cv.height * 0.33);
+    ctx.font = '400 18px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillStyle = score >= best && score > 0 ? '#4ade80' : '#9aa3b2';
+    ctx.fillText(score >= best && score > 0 ? '新紀錄' : '最高 ' + best,
+                 cv.width / 2, cv.height * 0.33 + 38);
+    // 講清楚是怎麼結束的 —— 不然會以為只有炸彈才會死
+    ctx.font = '400 15px -apple-system,"PingFang TC",sans-serif';
+    ctx.fillStyle = '#f87171';
+    ctx.fillText('砍到 ' + LIVES + ' 次炸彈', cv.width / 2, cv.height * 0.33 + 64);
+  }
+
+  function restart() {
+    // 注意：不重設校正。那是這個人的身形，不會因為重玩就變。
+    clearRuntime();
+    beginPlay();
+  }
+
+  function showResult(rows, verdict, tone) {
+    const dl = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
+    const cls = tone ? ' class="' + tone + '"' : '';
+    ui.result.innerHTML = '<h3>fp16 與 uint8 的差異</h3><dl>' + dl + '</dl>'
+      + '<div class="verdict"' + cls + '>' + verdict + '</div>';
+    ui.result.hidden = false;
+  }
+
+  ui.again.addEventListener('click', restart);
+
+  // 同一批影格、三組設定，把數字印出來比。
+  // 「分數低」跟「位置找錯」是兩件事，所以除了分數也要記下手腕落在哪。
+  ui.probe.addEventListener('click', async () => {
+    if (!video.videoWidth) { setStatus('要先按「開啟相機」。', true); return; }
+    ui.probe.disabled = true;
+    const JOINTS = ['left_shoulder','right_shoulder','left_elbow','right_elbow',
+                    'left_wrist','right_wrist'];
+    const dets = [];
+    try {
+      setStatus('載入三組模型…');
+      const mk = (type, url) => poseDetection.createDetector(
+        poseDetection.SupportedModels.MoveNet,
+        { modelType: poseDetection.movenet.modelType[type],
+          modelUrl: url, enableSmoothing: false, minPoseScore: 0.001 });
+
+      // 正方形置中裁切：MoveNet 內部會把輸入補成正方形，
+      // 4:3 的畫面補完之後人會偏小、也可能變形
+      const side = Math.min(video.videoWidth, video.videoHeight);
+      const crop = document.createElement('canvas');
+      crop.width = side; crop.height = side;
+      const cg = crop.getContext('2d');
+      const ox = (video.videoWidth - side) / 2, oy = (video.videoHeight - side) / 2;
+
+      const CFG = [
+        { name: 'A Lightning 完整畫面',
+          det: await mk('SINGLEPOSE_LIGHTNING', 'models/movenet-lightning/model.json'),
+          input: () => video, sx: 1, sy: 1, dx: 0, dy: 0 },
+        { name: 'B Thunder 完整畫面',
+          det: await mk('SINGLEPOSE_THUNDER', 'models/movenet-thunder/model.json'),
+          input: () => video, sx: 1, sy: 1, dx: 0, dy: 0 },
+        { name: 'C Lightning 正方裁切',
+          det: await mk('SINGLEPOSE_LIGHTNING', 'models/movenet-lightning/model.json'),
+          input: () => { cg.drawImage(video, ox, oy, side, side, 0, 0, side, side); return crop; },
+          sx: 1, sy: 1, dx: ox, dy: oy },
+      ];
+      for (const c of CFG) dets.push(c.det);
+
+      const acc = CFG.map(() => ({ scores: {}, wrist: [], n: 0, none: 0 }));
+      setStatus('舉起一隻手停著，正在比較三組設定（5 秒）…');
+      const until = performance.now() + 5000;
+      while (performance.now() < until) {
+        for (let i = 0; i < CFG.length; i++) {
+          const p = (await CFG[i].det.estimatePoses(CFG[i].input(),
+                      { flipHorizontal: false }))[0];
+          acc[i].n++;
+          if (!p) { acc[i].none++; continue; }
+          for (const k of p.keypoints) {
+            if (!JOINTS.includes(k.name)) continue;
+            (acc[i].scores[k.name] = acc[i].scores[k.name] || []).push(k.score);
+          }
+          // 分數最高的那隻手腕落在畫面的哪個位置（用比例表示，方便比較）
+          const lw = p.keypoints.find((k) => k.name === 'left_wrist');
+          const rw = p.keypoints.find((k) => k.name === 'right_wrist');
+          const best = (lw && rw) ? (lw.score >= rw.score ? lw : rw) : (lw || rw);
+          if (best) acc[i].wrist.push({
+            x: +((best.x + CFG[i].dx) / video.videoWidth).toFixed(3),
+            y: +((best.y + CFG[i].dy) / video.videoHeight).toFixed(3),
+            s: +best.score.toFixed(3) });
+        }
+      }
+
+      const med = (v) => { if (!v.length) return null;
+        const a = [...v].sort((x,y)=>x-y); return +a[a.length>>1].toFixed(3); };
+      const rows = CFG.map((c, i) => {
+        const r = { 設定: c.name, 幀數: acc[i].n, 沒偵測到: acc[i].none };
+        for (const j of JOINTS) r[j] = med(acc[i].scores[j] || []);
+        const w = acc[i].wrist;
+        r['最佳手腕分數'] = med(w.map((p) => p.s));
+        r['手腕位置x'] = med(w.map((p) => p.x));
+        r['手腕位置y'] = med(w.map((p) => p.y));
+        return r;
+      });
+
+      console.log('%c=== 三組偵測設定比較 ===', 'font-weight:bold');
+      console.table(rows);
+      console.log('手腕位置是畫面比例：x 0=左 1=右，y 0=上 1=下（未鏡像，相機原始座標）');
+      console.log(JSON.stringify(rows, null, 2));
+
+      showResult(rows.map((r) => [r.設定.slice(0, 16),
+        '腕 ' + (r.最佳手腕分數 ?? '—') + '　(' + (r.手腕位置x ?? '?') + ', '
+        + (r.手腕位置y ?? '?') + ')']),
+        '完整數字在主控台（F12 → Console），用 console.table 印成表格了。'
+        + '手腕位置若落在畫面下緣（y 接近 1），就表示模型把人認錯位置，不是分數問題。');
+      setStatus('比較完成，數字在下面與主控台。');
+    } catch (e) {
+      setStatus('比較失敗：' + e.message, true);
+      console.error(e);
+    } finally {
+      for (const d of dets) if (d && d.dispose) d.dispose();
+      ui.probe.disabled = false;
+    }
+  });
+
+  ui.reset.addEventListener('click', () => {
+    reenter();
+    setStatus('數字已歸零，重新揮一輪。');
+  });
+
+  ui.model.addEventListener('change', syncBladeOptions);
+
+  // 信心門檻只影響取點，不用重建模型，所以單獨接線
+  ui.stable.addEventListener('change', () => {
+    for (const k of Object.keys(joint)) delete joint[k];
+    for (const k of Object.keys(boneMed)) delete boneMed[k];
+    setStatus(ui.stable.checked ? '關節穩定化已開啟。' : '關節穩定化已關閉，可以比較差異。');
+  });
+
+  ui.scoreSel.addEventListener('change', () => {
+    if (autoScore()) {
+      setStatus('信心門檻改回自動，會跟著光線調整。');
+    } else {
+      // 手動選值視為覆寫，自動調整停止
+      MIN_SCORE = parseFloat(ui.scoreSel.value);
+      setStatus('信心門檻固定在 ' + MIN_SCORE.toFixed(2) + '，不再自動調整。');
+    }
+    reenter();
+  });
+
+  for (const node of [ui.backendSel, ui.model, ui.bladeSel, ui.smooth]) {
+    node.addEventListener('change', async () => {
+      if (!running) return;
+      running = false;
+      setStatus('正在重新設定…');
+      try {
+        await buildDetector();
+        reenter();
+        running = true; lastVideoTime = -1;
+        startLoops();
+        setStatus('換好了（' + tf.getBackend() + '），數字已歸零。');
+      } catch (e) {
+        // 失敗也要把迴圈開回來。原本只寫狀態列就結束，running 永遠停在
+        // false、兩條迴圈都不再排程，畫面凍在舊幀而且看起來完全正常。
+        setStatus('換不過去：' + (e.message || e) + '，維持原本的設定。', true);
+        try { await buildDetector(); } catch (e2) { /* 連舊的都建不回來 */ }
+        running = true; lastVideoTime = -1;
+        startLoops();
+      }
+    });
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    paused = document.hidden;
+    if (!paused) { lastT = 0; lastFrameAt = 0; lastBladeAt = performance.now(); }
+  });
+
+  best = loadBest();
+  probeBackends();
+  syncBladeOptions();
+  if (location.protocol === 'file:') {
+    setStatus('這個頁面要從 http://localhost 開才能用相機。', true);
+    ui.start.disabled = true;
+  }
+})();

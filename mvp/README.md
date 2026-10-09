@@ -531,7 +531,7 @@ Safari 那條是查出來的已知問題（[WebKit bug 187896](https://bugs.webk
 
 ## 參數都在哪
 
-`index.html` 開頭的 `F` 物件（距離門檻，單位是畫面寬的比例）、
+`app.js` 開頭的 `F` 物件（距離門檻，單位是畫面寬的比例）、
 `FOREARM_CM` / `PALM_CM` / `TIP_CM`（掌刀換算）、
 `SPAWN_MS_0` / `BOMB_P_0`（難度曲線，取自 `tubakhxn/Webcam-Fruit-Ninja` 調好的值）。
 

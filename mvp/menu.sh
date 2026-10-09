@@ -101,17 +101,23 @@ do_check() {
   sp=$(mktemp -d)
 
   printf '%s語法%s\n' "$c_b" "$c_0"
-  python3 - "$sp/inline.js" <<'PY'
-import re, sys
-src = open('index.html', encoding='utf-8').read()
-open(sys.argv[1], 'w', encoding='utf-8').write(
-    '\n'.join(re.findall(r'<script>(.*?)</script>', src, re.S)))
-PY
-  if node --check "$sp/inline.js" >/dev/null 2>&1; then
-    printf '  %s✓%s index.html 內嵌 JS\n' "$c_g" "$c_0"
+  if node --check app.js >/dev/null 2>&1; then
+    printf '  %s✓%s app.js\n' "$c_g" "$c_0"
   else
-    printf '  %s✗%s index.html 內嵌 JS\n' "$c_r" "$c_0"
-    node --check "$sp/inline.js" 2>&1 | head -3 | sed 's/^/    /'
+    printf '  %s✗%s app.js\n' "$c_r" "$c_0"
+    node --check app.js 2>&1 | head -3 | sed 's/^/    /'
+    fail=1
+  fi
+
+  # 程式碼搬出去之後，index.html 裡不該再留下內嵌的 <script> ——
+  # 留著的話 codegraph 索引不到，而且兩邊會各自漂走。
+  if grep -q '<script>' index.html; then
+    printf '  %s✗%s index.html 又出現內嵌 <script>，請搬到 app.js\n' "$c_r" "$c_0"
+    fail=1
+  elif grep -q 'src="app.js"' index.html; then
+    printf '  %s✓%s index.html 有載入 app.js\n' "$c_g" "$c_0"
+  else
+    printf '  %s✗%s index.html 沒有載入 app.js\n' "$c_r" "$c_0"
     fail=1
   fi
 

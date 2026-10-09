@@ -15,7 +15,8 @@ cd mvp && ./menu.sh open          # 開（伺服器沒跑會自動起）
 ./menu.sh models                  # 把模型抓到本機（第一次建議做，開頁從 5.3s → 45ms）
 ```
 
-純前端單檔（`mvp/index.html`，約 2800 行），TF.js + MoveNet Lightning。
+純前端（`mvp/index.html` 約 220 行畫面 + `mvp/app.js` 約 2700 行程式），
+TF.js + MoveNet Lightning。
 流程：點「開啟相機」→ 看到自己 → 手停在圓圈 2 秒 → 開始 → 砍到 3 顆炸彈結束。
 
 **使用者實際玩過，最高分 70。核心玩法成立。**
@@ -54,7 +55,7 @@ cd mvp && ./menu.sh open          # 開（伺服器沒跑會自動起）
 
 **P0 — 會讓遊戲難以遊玩**
 
-1. **`SPEED_FOREARM = 16` 沒有餘裕**（`index.html` 搜 `SPEED_FOREARM`）
+1. **`SPEED_FOREARM = 16` 沒有餘裕**（`app.js` 搜 `SPEED_FOREARM`）
    門檻 = 16×0.25m = **恰好 4.0 m/s**，而 README 自己寫人類全力揮擊就是 3–4 m/s。
    校正鎖定後門檻從未校正的 6.0 收緊到 4.0。被擋時手腕凍結最多 250ms，
    整刀被抹掉而畫面上沉默。
