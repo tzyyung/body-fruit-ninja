@@ -302,13 +302,23 @@
       + MB(dl.got) + ' / ' + MB(dl.total) + ' MB，約 ' + left + ' 秒）';
   }
 
-  // 按模型分開記 —— 面板可以換模型，不分開的話換了還是回上一個的網址。
-  let prefetching = null, prefetchKey = null;
+  // 「這個模型的 model.json 在哪」—— 唯一的入口。
+  // 回 null 表示抓不到任何來源，呼叫端就不要給 modelUrl，讓 tfjs 自己去 tfhub。
+  // 面板上的比較按鈕也一定要走這裡：寫死 'models/...' 的話在 GitHub Pages
+  // 上就是 43KB/s，比對 fp16/uint8 要抓 7MB、三組設定要抓 17MB。
+  const modelHref = (key) => prefetchModel(key);
+
+  // 每個模型各自記。共用一個槽位的話，面板那兩個比較按鈕輪流要三個模型
+  // 就會互相把對方的結果蓋掉，然後每個都重抓一次。
+  const prefetched = new Map();
   function prefetchModel(key) {
-    if (prefetching && prefetchKey === key) return prefetching;
-    prefetchKey = key;
+    if (prefetched.has(key)) return prefetched.get(key);
     const m = MODELS[key];
-    if (!m || !m.dir) return (prefetching = Promise.resolve(null));
+    if (!m || !m.dir) {
+      const none = Promise.resolve(null);
+      prefetched.set(key, none);
+      return none;
+    }
 
     const sources = [{ name: '本機', base: m.dir }];
     const cdn = cdnBase();
@@ -317,7 +327,7 @@
     dl.active = true; dl.got = 0; dl.total = m.bytes; dl.done = false;
     dl.startAt = dl.moveAt = performance.now();
 
-    prefetching = (async () => {
+    const job = (async () => {
       // 每個檔各自記，加起來才是進度。
       // 原本是「上一個檔的累計 + 這個檔的目前」，那只在一個一個抓時成立。
       const got = Object.create(null);
@@ -351,7 +361,8 @@
       console.warn('[模型] 預先下載失敗，改用 tfhub：' + (e && e.message));
       return null;
     });
-    return prefetching;
+    prefetched.set(key, job);
+    return job;
   }
 
   // ---- DOM -----------------------------------------------------------------
@@ -628,7 +639,7 @@
     if (m.kind === 'movenet') {
       // 先把檔案抓下來（有進度可以看），tfjs 等一下讀的是 HTTP 快取。
       // 抓不到任何來源就回 null，讓 tfjs 自己去 tfhub 拿。
-      const url = await prefetchModel(key);
+      const url = await modelHref(key);
       const cfg = {
         modelType: poseDetection.movenet.modelType[m.modelType],
         enableSmoothing: ui.smooth.checked,
@@ -3426,12 +3437,16 @@
     let a = null, b = null;
     try {
       setStatus('載入兩個模型…');
+      // url 可能是 null（所有來源都抓不到）。null 不能丟給 tfjs ——
+      // 它會當成一個網址去抓，要整個不給 modelUrl 才會回去用 tfhub。
       const mk = (url) => poseDetection.createDetector(
         poseDetection.SupportedModels.MoveNet,
-        { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
-          modelUrl: url, enableSmoothing: false, minPoseScore: 0.2 });
-      a = await mk('models/movenet-lightning/model.json');
-      b = await mk('models/movenet-lightning-uint8/model.json');
+        Object.assign(
+          { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+            enableSmoothing: false, minPoseScore: 0.2 },
+          url ? { modelUrl: url } : null));
+      a = await mk(await modelHref('movenet-lightning'));
+      b = await mk(await modelHref('movenet-lightning-uint8'));
 
       const dArm = [], dAll = [], sA = [], sB = [];
       let frames = 0, missA = 0, missB = 0;
@@ -3650,10 +3665,13 @@
     const dets = [];
     try {
       setStatus('載入三組模型…');
+      // 同上：null 要變成「不給 modelUrl」，不是「modelUrl 是 null」
       const mk = (type, url) => poseDetection.createDetector(
         poseDetection.SupportedModels.MoveNet,
-        { modelType: poseDetection.movenet.modelType[type],
-          modelUrl: url, enableSmoothing: false, minPoseScore: 0.001 });
+        Object.assign(
+          { modelType: poseDetection.movenet.modelType[type],
+            enableSmoothing: false, minPoseScore: 0.001 },
+          url ? { modelUrl: url } : null));
 
       // 正方形置中裁切：MoveNet 內部會把輸入補成正方形，
       // 4:3 的畫面補完之後人會偏小、也可能變形
@@ -3665,13 +3683,13 @@
 
       const CFG = [
         { name: 'A Lightning 完整畫面',
-          det: await mk('SINGLEPOSE_LIGHTNING', 'models/movenet-lightning/model.json'),
+          det: await mk('SINGLEPOSE_LIGHTNING', await modelHref('movenet-lightning')),
           input: () => video, sx: 1, sy: 1, dx: 0, dy: 0 },
         { name: 'B Thunder 完整畫面',
-          det: await mk('SINGLEPOSE_THUNDER', 'models/movenet-thunder/model.json'),
+          det: await mk('SINGLEPOSE_THUNDER', await modelHref('movenet-thunder')),
           input: () => video, sx: 1, sy: 1, dx: 0, dy: 0 },
         { name: 'C Lightning 正方裁切',
-          det: await mk('SINGLEPOSE_LIGHTNING', 'models/movenet-lightning/model.json'),
+          det: await mk('SINGLEPOSE_LIGHTNING', await modelHref('movenet-lightning')),
           input: () => { cg.drawImage(video, ox, oy, side, side, 0, 0, side, side); return crop; },
           sx: 1, sy: 1, dx: ox, dy: oy },
       ];
@@ -3796,8 +3814,8 @@
   // showDownload 自己會在沒在下載時把進度條收起來，所以這個 tick
   // 不自己停 —— 停掉的話換模型重抓就沒人更新了。200ms 一次幾乎零成本。
   setInterval(showDownload, 200);
-  // 換模型就重抓（而且是換成那個新的）
-  ui.model.addEventListener('change', () => prefetchModel(ui.model.value));
+  // 換模型就先抓起來，不要等按下去才開始等（buildDetector 會等同一個 Promise）
+  ui.model.addEventListener('change', () => modelHref(ui.model.value));
   const blocked = cameraBlockedWhy();
   if (blocked) { setStatus(blocked, true); ui.start.disabled = true; }
 })();

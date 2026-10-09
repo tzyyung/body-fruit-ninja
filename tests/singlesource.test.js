@@ -197,6 +197,24 @@ t('drawReady 不拿 detector 當有沒有圓圈的依據',
   /\bdetector\b/.test(body('drawReady')), false);
 t('drawReady 問的是 hoverBtns', /hoverBtns/.test(body('drawReady')), true);
 
+section('模型網址只能從一個地方來');
+
+// 面板上的兩個比較按鈕原本寫死 'models/xxx/model.json'，繞過來源賽跑 ——
+// 在 GitHub Pages 上那是 43KB/s，比對 fp16/uint8 要抓 7MB、
+// 三組設定要抓 17MB（含 12MB 的 thunder）。等於按下去就當掉。
+t('modelHref 只有一個定義', count('const modelHref ='), 1);
+// MODELS 的 dir 是三筆；除此之外不准再出現寫死的模型路徑
+t('沒有寫死的 model.json 路徑',
+  (code.match(/'models\/[\w-]+\/model\.json'/g) || []).length, 0);
+// null 代表「所有來源都抓不到」。null 不能丟給 tfjs —— 它會當成網址去抓。
+// 所以每一處 modelUrl: url 都必須包在守衛裡，數量要一樣多。
+{
+  const all = (code.match(/modelUrl: url/g) || []).length;
+  const guarded = (code.match(/url \? \{ modelUrl: url \} : null/g) || []).length;
+  t('每個 modelUrl: url 都在守衛裡', all - guarded, 0);
+  t('兩個比較按鈕都有守衛', guarded, 2);
+}
+
 section('懸停圓圈用比例存，不要存像素');
 
 // 2026-10-09 Android 回報「出現圓圈但很快就又消失了」，WebGPU 不會、
