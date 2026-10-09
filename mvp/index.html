@@ -128,6 +128,7 @@
       <dt>手臂不可信</dt><dd id="m-arm">—</dd>
       <dt>骨鏈不成立</dt><dd id="m-chain">—</dd>
       <dt>左手／右手鏈</dt><dd id="m-chain2">—</dd>
+      <dt>軌跡證據 左／右</dt><dd id="m-track">—</dd>
       <dt>目前狀態</dt><dd id="m-state">—</dd>
       <div class="sep"></div>
       <dt>刀痕成立率</dt><dd id="m-link">—</dd>
@@ -366,6 +367,7 @@
     combo:el('m-combo'), crit:el('m-crit'), lr:el('m-lr'),
     jump:el('m-jump'), bone:el('m-bone'), side:el('m-side'), arm:el('m-arm'),
     chain:el('m-chain'), chain2:el('m-chain2'), state:el('m-state'),
+    track:el('m-track'),
     link:el('m-link'), rejMove:el('m-rej-move'), rejTime:el('m-rej-time'),
     rejRange:el('m-rej-range'), gapAvg:el('m-gapavg'), lin:el('m-lin'),
     stroke:el('m-stroke'), gen:el('m-gen'),
@@ -418,6 +420,14 @@
   const joint  = {};            // 關節名 → { x, y, t, heldSince }
   // 每一側上一次被信任的鏈，用來判斷延續性
   const chainHist = { left: null, right: null };
+  // 每一側累積的對數勝算比，以及「已確認」這個鎖存狀態。
+  //
+  // SPRT 的決策是鎖存的：兩個界限之間維持上一次的判定，不重新測。
+  // 原本每幀重新比 Λ ≥ A，等於把它當成水位計 —— 已確認的手臂
+  // 壞一幀（Λ 掉到 −1.63）就失去身分，而快揮時的動態模糊正好
+  // 會造成那一幀，刀會在揮到一半時消失。
+  const track = { left: 0, right: 0 };
+  const confirmed = { left: false, right: false };
   const boneMed = {};           // 骨頭名 → 長度中位數用的樣本
   let stats = freshStats();
 
@@ -453,6 +463,13 @@
     // navigator.mediaDevices 整個是 undefined —— 不是權限被拒，是 API 不見了。
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       throw new Error('這個頁面要從 http://localhost 開才能用相機，直接用檔案路徑打開不行。');
+    }
+    // 重開相機前先把舊的收掉：不停的話舊 track 仍 live、舊的 rVFC 鏈
+    // 會繼續續接（它只看 video.srcObject）、舊 track 的 ended 監聽器
+    // 稍後還會把新的一局殺掉
+    if (video.srcObject) {
+      for (const t of video.srcObject.getTracks()) t.stop();
+      video.srcObject = null;
     }
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { width:{ideal:640}, height:{ideal:480}, facingMode:'user' }, audio:false });
@@ -492,9 +509,16 @@
     if (!running) return;
     running = false;
     hoverBtns = [];
+    clearFruits();
+    phase = 'idle'; demoMode = false;
+    if (video.srcObject) {
+      for (const t of video.srcObject.getTracks()) t.stop();
+      video.srcObject = null;
+    }
+    syncHint();   // 把提示框與按鈕叫回來，否則按鈕是 0×0
     ui.start.disabled = false;
     ui.start.textContent = '重新開啟相機';
-    setStatus(why + '。按「重新開啟相機」再試一次。', true);
+    setStatus(why + '。按畫面中央的按鈕再試一次。', true);
   }
 
   // ---- backend / 模型 ------------------------------------------------------
@@ -633,20 +657,35 @@
     chainHist[side] = rec;
   }
 
-  // 哪一邊的證據比較強。
-  //
-  // 不能只比分數：手往前伸時那隻真手的信心會因為投影而下降，
-  // 模型猜的幽靈手分數可能還比較高 —— 只比分數會把真手丟掉。
-  // 連續性是更可靠的證據：真手是連續動作的產物，幽靈手不是。
-  function armScore(side, kp, now) {
-    let t = 0;
-    for (const part of ARM) {
-      const k = kp[side + '_' + part];
-      t += k ? k.score : 0;
+  // 這一幀這一側的三項證據，累積成對數勝算比
+  function updateTracks(kp, now) {
+    for (const side of SIDES) {
+      const sh = kp[side + '_shoulder'], eb = kp[side + '_elbow'],
+            wr = kp[side + '_wrist'];
+      if (!sh || !eb || !wr) {
+        // 連三個點都湊不齊，直接往丟棄端推
+        track[side] = Math.max(SPRT_B, track[side] - 2);
+        latch(side);
+        if (!confirmed[side]) chainHist[side] = null;
+        continue;
+      }
+      const d = llr('chain',  chainOK(sh, eb, wr, shoulderWidth(kp)))
+              + llr('cont',   continuity(side, kp, now) > 0.25)
+              + llr('strong', wr.score >= MIN_SCORE * 1.5);
+      track[side] = Math.min(SPRT_A, Math.max(SPRT_B, track[side] + d));
+      latch(side);
+      if (!confirmed[side] && track[side] <= SPRT_B) chainHist[side] = null;
+      else rememberChain(side, kp, now);
     }
-    // 連續性最多可以抵過 1.5 分的信心差距
-    return t + continuity(side, kp, now) * 1.5;
   }
+
+  // 鎖存：越過上界才確認，越過下界才撤銷，中間維持現狀
+  function latch(side) {
+    if (track[side] >= SPRT_A * 0.999) confirmed[side] = true;
+    else if (track[side] <= SPRT_B * 0.999) confirmed[side] = false;
+  }
+
+  const hasTrack = (side) => confirmed[side];
 
   // 兩肩都看得到才有肩寬可用；只看得到一邊就回 0，那道檢查自動略過
   function shoulderWidth(kp) {
@@ -717,9 +756,8 @@
       // 幾何過不了但接得上自己上一幀的鏈 → 仍然可信。
       // 手往前伸是連續動作，中途某幾幀的幾何可能剛好落在邊界外，
       // 不該因此整條鏈作廢。
-      const geoOK = eb && sh && chainOK(sh, eb, wrist, shoulderWidth(kp));
-      const contOK = eb && sh && continuity(side, kp, now) > 0.25;
-      if (geoOK || contOK) {
+      // 軌跡沒站穩就不給刀 —— 幽靈手撐不過連續幾幀的確認
+      if (eb && sh && hasTrack(side)) {
         const foreLen = Math.hypot(wrist.x - eb.x, wrist.y - eb.y);
         stats.forearm = Math.max(stats.forearm, foreLen);
 
@@ -737,7 +775,6 @@
         const off = foreLen * K;
         const x = wrist.x + (wrist.x - ax) / len * off;
         const y = wrist.y + (wrist.y - ay) / len * off;
-        rememberChain(side, kp, now);
         return { bx:x, by:y, tx:x, ty:y, pad: px(PALM_PAD) };
       }
       // 鏈不成立 → 沒有刀。不做「退化成手腕單點」。
@@ -748,7 +785,6 @@
       // 一隻手就長出兩把刀。位置錯的刀比沒有刀糟得多：
       // 會誤砍炸彈、斷連擊、讓整個遊戲看起來是隨機的。
       stats.chainBroken++;
-      chainHist[side] = null;
       return null;
     }
     if (mode === 'wrist') {
@@ -1605,6 +1641,39 @@
   const CHAIN_MEM_MS = 700;    // 記得多久以前的鏈
   const CHAIN_MOVE = 0.55;     // 每 33ms 每個關節最多移動幾倍前臂長
 
+  // 軌跡確認：序列機率比檢定（SPRT, Wald）。
+  //
+  // 這是資料關聯問題：真實世界有 1–2 隻手臂，模型每幀吐出 2 條標好左右的
+  // 鏈，要決定哪些是真的。每一幀是一次觀測，累積對數勝算比：
+  //
+  //   Λ ← Λ + log( P(觀測|真手) / P(觀測|幽靈) )
+  //   Λ ≥ A → 確認      A = log((1−β)/α)
+  //   Λ ≤ B → 丟棄      B = log(β/(1−α))
+  //
+  // 好處是門檻由「願意接受的錯誤率」推導，不是挑出來的：
+  //   α = 把幽靈當成真手的機率
+  //   β = 把真手當成幽靈的機率
+  // 而每一項證據的權重也不是選的，是該特徵在兩種假設下出現機率的比值。
+  //
+  // 這取代了先前的 +1/−1、門檻 3 計數器 —— 那其實是 SPRT 的退化版
+  // （二元證據、所有證據等權）。分級證據才用得到它的長處：
+  // 強確認的一幀抵得過兩幀勉強的，不必等滿固定幀數。
+  const SPRT_ALPHA = 0.01, SPRT_BETA = 0.05;
+  const SPRT_A = Math.log((1 - SPRT_BETA) / SPRT_ALPHA);   // ≈ +4.55
+  const SPRT_B = Math.log(SPRT_BETA / (1 - SPRT_ALPHA));   // ≈ −2.98
+
+  // 每一項證據：[P(出現|真手), P(出現|幽靈)]。
+  // 這些是假設，但是「可以討論的假設」—— 不像權重 1.5 無從檢驗。
+  const EV = {
+    chain:  [0.95, 0.30],   // 骨鏈幾何成立
+    cont:   [0.92, 0.15],   // 接得上自己上一幀（幽靈沒有穩定歷史）
+    strong: [0.80, 0.35],   // 手腕信心明顯高於門檻
+  };
+  const llr = (k, yes) => {
+    const [p1, p0] = EV[k];
+    return yes ? Math.log(p1 / p0) : Math.log((1 - p1) / (1 - p0));
+  };
+
   // ── 校正 ──
   // 原本所有門檻都是用「畫面寬的比例」表示的，那已經比寫死像素好，
   // 但畫面寬跟「這個人的手臂有多長」沒有關係 —— 站遠一點、手臂短一點，
@@ -1900,11 +1969,22 @@
     // 先決定哪幾隻手臂可用，再去算刀刃。
     // 兩邊的點重疊時，弱的那一邊直接從 kp 裡拿掉 ——
     // 不能只是「不給它刀」，要讓它完全沒機會沾到另一邊的點。
+    // 先更新軌跡信用，再決定重疊時留誰
+    updateTracks(kp, now);
+
     if (!armsDistinct(kp)) {
-      const weak = armScore('left', kp, now) >= armScore('right', kp, now)
-        ? 'right' : 'left';
+      // 信用高的留下。信用相同才比手腕分數。
+      let weak;
+      if (Math.abs(track.left - track.right) > 0.01) {
+        weak = track.left > track.right ? 'right' : 'left';
+      } else {
+        const sl = (kp.left_wrist  && kp.left_wrist.score)  || 0;
+        const sr = (kp.right_wrist && kp.right_wrist.score) || 0;
+        weak = sl >= sr ? 'right' : 'left';
+      }
       for (const part of ARM) delete kp[weak + '_' + part];
       chainHist[weak] = null;
+      track[weak] = SPRT_B; confirmed[weak] = false;
       stats.lrRejects++;
     }
 
@@ -2328,6 +2408,10 @@
     ui.side.textContent = stats.sideFix;
     ui.arm.textContent  = stats.armHidden;
     ui.chain.textContent = stats.chainBroken;
+    ui.track.textContent =
+      track.left.toFixed(1) + (confirmed.left ? '✓' : '') + ' / ' +
+      track.right.toFixed(1) + (confirmed.right ? '✓' : '') +
+      '（' + SPRT_B.toFixed(1) + ' … ' + SPRT_A.toFixed(1) + '）';
     ui.state.textContent = lostPerson ? '沒看到人（暫停）'
       : paused ? '分頁在背景' : demoMode ? phase + '（示範）' : phase;
     // 兩隻手各自的鏈現在成不成立，一眼看出是哪一邊有問題
@@ -2368,13 +2452,25 @@
   }
 
   // ---- 控制 ----------------------------------------------------------------
+  // 一次把水果清乾淨，連引信一起停。原本停引信的迴圈寫在 fruits = []
+  // 之後，永遠跑 0 圈 —— 炸彈從畫面消失，嘶嘶聲繼續響到 buffer 播完。
+  function clearFruits() {
+    for (const f of fruits) if (f.stopFuse) f.stopFuse();
+    fruits = [];
+  }
+
+  // 只負責歸零量測與遊戲狀態，不碰 phase、不碰 hoverBtns。
+  // 原本它把 phase 推到 'ready' 卻沒重建「開始」圓圈，而唯一的
+  // 「開啟相機」按鈕在 .hint 裡、phase !== 'idle' 時整個隱藏 ——
+  // 五個入口（歸零重測／四個 select）全都會卡進「有畫面、沒有任何可按的東西」。
   function clearRuntime() {
-    stats = freshStats(); fruits = []; bits = []; marks = []; pops = []; score = 0;
+    stats = freshStats(); clearFruits(); bits = []; marks = []; pops = []; score = 0;
     lives = LIVES; over = false; ui.again.hidden = true; hoverBtns = [];
     freezeUntil = 0; doubleUntil = 0; comboN = 0;
-    lastBladeAt = 0; lostPerson = false;
-    for (const f of fruits) if (f.stopFuse) f.stopFuse();
-    phase = phase === 'idle' ? 'idle' : 'ready';
+    lastBladeAt = 0; lostPerson = false; demoMode = false;
+    track.left = 0; track.right = 0;
+    confirmed.left = false; confirmed.right = false;
+    chainHist.left = null; chainHist.right = null;
     strokeCache.left = null; strokeCache.right = null;
     for (const s of SIDES) { trails[s] = []; bases[s] = []; prev[s] = null; }
   }
@@ -2390,6 +2486,7 @@
       // 模型冷啟要幾秒，這段時間使用者只看得到提示框，會以為當掉了。
       await startCamera();
       clearRuntime(); running = true; lastVideoTime = -1;
+      phase = 'ready'; syncHint();   // 相機一好就把提示框收起來，先讓人看到自己
       nextSpawn = Infinity;   // 模型還沒好就先不要丟水果，不然會白白算成漏接
       startLoops();
       setStatus('相機好了，正在載入模型…');
@@ -2429,10 +2526,10 @@
       hitFruit(f, 0.5);
       setStatus('切成兩半了。再按一次會把兩半各自再切開。');
     }
-    // 示範不需要相機，所以從 idle 也要能進 playing（只有結束畫面不打擾）
-    if (phase !== 'over') phase = 'playing';
+    // 示範不要借用 phase。原本從 idle 直接推成 'playing'，
+    // syncHint() 會因此把提示框藏起來 —— 唯一的「開啟相機」按鈕就在裡面，
+    // 按一次示範就永久失去開相機的能力。
     demoMode = true;
-    syncHint();
     if (!running) { running = true; startLoops(); }
   });
 
@@ -2534,7 +2631,20 @@
   // 看得到自己、但遊戲還沒開始。站好位置，再把手停到圓圈上。
   // 提示框只在還沒開相機時出現。散在各條路徑裡手動開關，
   // 遲早會有一條忘記關 —— 示範按鈕那條就忘了，結果提示蓋在結束畫面上。
-  function syncHint() { ui.hint.hidden = (phase !== 'idle'); }
+  // 提示框（連同「開啟相機」按鈕）只要相機還沒跑起來就該在。
+  // 不能只看 phase —— 示範模式與相機斷線都會讓 phase 不是 idle，
+  // 但那兩種情形使用者正需要那顆按鈕。
+  function syncHint() {
+    ui.hint.hidden = !!(video.srcObject && phase !== 'idle');
+  }
+
+  // 歸零之後要把該有的互動補回去 —— 這是 clearRuntime 不碰 phase 的配套
+  function reenter() {
+    clearRuntime();
+    if (phase === 'over') showGameOver();
+    else if (phase !== 'idle') enterReady();
+    syncHint();
+  }
 
   function enterReady() {
     phase = 'ready';
@@ -2728,7 +2838,7 @@
   });
 
   ui.reset.addEventListener('click', () => {
-    clearRuntime();
+    reenter();
     setStatus('數字已歸零，重新揮一輪。');
   });
 
@@ -2749,7 +2859,7 @@
       MIN_SCORE = parseFloat(ui.scoreSel.value);
       setStatus('信心門檻固定在 ' + MIN_SCORE.toFixed(2) + '，不再自動調整。');
     }
-    clearRuntime();
+    reenter();
   });
 
   for (const node of [ui.backendSel, ui.model, ui.bladeSel, ui.smooth]) {
@@ -2759,11 +2869,18 @@
       setStatus('正在重新設定…');
       try {
         await buildDetector();
-        clearRuntime();
+        reenter();
         running = true; lastVideoTime = -1;
         startLoops();
         setStatus('換好了（' + tf.getBackend() + '），數字已歸零。');
-      } catch (e) { setStatus(e.message || String(e), true); }
+      } catch (e) {
+        // 失敗也要把迴圈開回來。原本只寫狀態列就結束，running 永遠停在
+        // false、兩條迴圈都不再排程，畫面凍在舊幀而且看起來完全正常。
+        setStatus('換不過去：' + (e.message || e) + '，維持原本的設定。', true);
+        try { await buildDetector(); } catch (e2) { /* 連舊的都建不回來 */ }
+        running = true; lastVideoTime = -1;
+        startLoops();
+      }
     });
   }
 
