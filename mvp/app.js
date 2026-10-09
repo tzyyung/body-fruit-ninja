@@ -503,9 +503,10 @@
         continue;
       }
       const okChain  = chainOK(sh, eb, wr, shoulderWidth(kp), side);
-      const okCont   = continuity(side, kp, now) > 0.25;
+      const contVal  = continuity(side, kp, now);
+      const okCont   = contVal > 0.25;
       const okStrong = wr.score >= MIN_SCORE * 1.5;
-      evLast[side] = { chain: okChain, cont: okCont, strong: okStrong };
+      evLast[side] = { chain: okChain, cont: okCont, contVal, strong: okStrong };
       const d = llr('chain', okChain) + llr('cont', okCont) + llr('strong', okStrong);
       track[side] = Math.min(SPRT_A, Math.max(SPRT_B, track[side] + d));
       latch(side);
@@ -562,7 +563,17 @@
     // 前臂橫向伸出時，上臂縮成 10px 而前臂 70px，比值 7.0，
     // 但那是完全正常的姿勢。上界只對單一線段成立，對比值不成立。
     if (shoulderW > 4 && upper / shoulderW > UPPER_VS_SHOULDER_HI) return false;
-    if (calib && calib.forearm > 4 && fore / calib.forearm > 2.2) return false;
+    // 前臂的上界也用肩寬，不用校正值。
+    //
+    // 原本是 fore / calib.forearm > 2.2。問題是 calib.forearm 是「學來的」，
+    // 學壞了就會變成一道關掉整條管線的閘門 —— 實測它被幽靈手臂的樣本
+    // 汙染到 40px，於是「超過 88px 就擋」，真手臂一律不合格，
+    // 鏈永遠不成立、SPRT 一路掉到下界、永遠沒有刀，而且不會自己好。
+    //
+    // 肩寬是這一幀直接量到的，不經過任何估計器，壞不了。
+    // 成人前臂約 25cm、肩寬約 40cm，比值約 0.63；投影只會讓它變短，
+    // 所以 1.6 已經留了兩倍半的餘裕。
+    if (shoulderW > 4 && fore / shoulderW > FORE_VS_SHOULDER_HI) return false;
     return true;
   }
 
@@ -829,7 +840,12 @@
 
   // 三個量，三種波動性。預設值都用畫面比例，量到之後換成身體尺度。
   const trk = {
-    forearm: Tracked({ volatility: 'static', fallback: 0 }),
+    // 估計量用第 80 百分位，不是中位數。
+    // 透視投影「只會讓線段變短、不會變長」，所以觀測值的分布是
+    // 「真實長度」往下拖出一條尾巴 —— 中位數會被每一幀的前縮系統性低估，
+    // 也會被殘留的幽靈樣本拉走。取高百分位才貼近真實長度。
+    forearm: Tracked({ volatility: 'static', fallback: 0,
+                       estimate: (v) => pctile(v, 0.80) }),
     // 雜訊地板取每幀位移的第 10 百分位 —— 不需要請人站著別動，
     // 任何一段時間裡都有手比較靜的時刻，那些低位移就是雜訊
     noise: Tracked({ volatility: 'static', fallback: 0,
@@ -856,15 +872,25 @@
       // 要靠低信心才會啟動的自動放寬，卻用高信心當入場券，永遠跑不起來。
       if (e) trk.score.push(e.score);
       if (w) trk.score.push(w.score);
-      if (e && w && e.score >= 0.25 && w.score >= 0.25) {
-        const r = trk.forearm.push(Math.hypot(e.x - w.x, e.y - w.y));
-        if (r === 'changed') {
-          // 位置變了就連雜訊地板一起重量 —— 距離不同，雜訊的像素尺度也不同。
-          // 同時重開靜止窗，讓它有機會在新位置重新量一次。
-          trk.noise.reset(); calLast = null;
-          readyAt = performance.now();
-          setStatus('你的位置變了，重新量一次。');
-        }
+      // 前臂樣本的門檻跟著 MIN_SCORE 走，不要寫死 0.25 ——
+      // MIN_SCORE 會自動降到 0.12，寫死的話暗房裡刀能用但校正永遠不啟動。
+      if (!e || !w || e.score < MIN_SCORE || w.score < MIN_SCORE) continue;
+      const len = Math.hypot(e.x - w.x, e.y - w.y);
+      // 用當幀的肩寬把明顯不是手臂的樣本擋掉。
+      //
+      // 兩隻手的樣本是丟進同一個估計器的，而沒舉起的那隻手，模型會把
+      // 手肘和手腕都猜在身體邊緣、擠成 20–50px。兩群數值混在一起取中位數，
+      // 中位數就掉進幽靈那一群 —— 實測校正值因此鎖在 40px。
+      // 肩寬是這一幀量到的，不經過估計器，拿它當尺規最安全。
+      const sw = shoulderWidth(kp);
+      if (sw > 4 && (len / sw < FORE_VS_SHOULDER_LO
+                  || len / sw > FORE_VS_SHOULDER_HI)) continue;
+      if (trk.forearm.push(len) === 'changed') {
+        // 位置變了就連雜訊地板一起重量 —— 距離不同，雜訊的像素尺度也不同。
+        // 同時重開靜止窗，讓它有機會在新位置重新量一次。
+        trk.noise.reset(); calLast = null;
+        readyAt = performance.now();
+        setStatus('你的位置變了，重新量一次。');
       }
     }
     // 雜訊只在「靜止窗」裡收：相機剛開、人還沒把手移到按鈕上的那幾秒。
@@ -887,7 +913,12 @@
 
   function recalc() {
     if (!trk.forearm.n) { calib = null; return; }
-    const forearm = trk.forearm.value;
+    // 鎖定前用 raw（估計器的原始輸出），不要用 value。
+    //
+    // Tracked.value 在未鎖定時已經是 est × weight 了，recalc 下面的 mix()
+    // 會再乘一次 —— 權重套兩次，門檻在校正中途非單調，而且 calib.forearm
+    // 被系統性低估。混合只該做一次，就是 mix() 那次。
+    const forearm = trk.forearm.settled ? trk.forearm.value : trk.forearm.raw;
     const noise = trk.noise.value;
     const w = trk.forearm.weight;
     const mix = (def, got) => def * (1 - w) + got * w;
@@ -897,7 +928,11 @@
       score: trk.score.value,
       slashMin: mix(px(F.slashMin),
                     Math.max(forearm * SLASH_FOREARM, noise * SLASH_NOISE_MUL)),
-      maxSpeed: mix(px(MAX_JOINT_SPEED), forearm * SPEED_FOREARM),
+      // 下限用畫面比例兜著。校正值一旦被汙染變小，這裡會跟著變嚴，
+      // 關節被凍住 → 凍住的點再回頭餵給校正 → 越來越小。那是會自己惡化的
+      // 迴路，實測跳動閘門因此觸發 3164 次。給它一個跟身形無關的地板。
+      maxSpeed: Math.max(px(MAX_JOINT_SPEED) * 0.5,
+                         mix(px(MAX_JOINT_SPEED), forearm * SPEED_FOREARM)),
     };
   }
 
@@ -1196,63 +1231,71 @@
     }
     const kp = {};
     for (const k of lastPose.keypoints) if (k.name) kp[k.name] = k;
-    const parts = [];
-    for (const side of SIDES) {
-      const bits2 = [];
-      for (const part of ARM) {
-        const k = kp[side + '_' + part];
-        const need = part === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE;
-        const sc = k ? k.score : 0;
-        bits2.push({ label: { shoulder:'肩', elbow:'肘', wrist:'腕' }[part],
-                     sc, ok: sc >= need });
-      }
-      parts.push({ side: side === 'left' ? '左' : '右', bits: bits2 });
-    }
-    ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
-    let x = cv.width / 2 - 150;
-    for (const p of parts) {
-      ctx.textAlign = 'left';
-      ctx.fillStyle = '#9aa3b2';
-      ctx.fillText(p.side, x, y);
-      x += 18;
-      for (const b of p.bits) {
-        ctx.fillStyle = b.ok ? '#4ade80' : '#f87171';
-        ctx.fillText(b.label + ' ' + b.sc.toFixed(2), x, y);
-        x += 52;
-      }
-      x += 14;
-    }
-    ctx.textAlign = 'center';
-    // 分數都過了卻還是沒有刀，表示是後面的關卡擋的。
-    // 不講出是哪一關，使用者看到三個綠色數字只會以為程式壞了。
-    // 一手一行 —— 兩行併一行最長會到 38 個全形字，640 寬的畫布塞不下。
+
     const why = SIDES
       .filter((sd) => noBlade[sd])
       .map((sd) => (sd === 'left' ? '左手' : '右手') + '　' + noBlade[sd]);
+
+    // 軌跡確認不了是最難從外面看出原因的一種 —— 把證據攤開。
+    // 這幾行是給開發者看的儀器，跟上面給玩家的提示分開。
+    const ev = !why.length ? [] : SIDES.map((sd) => {
+      const e = evLast[sd], c = chainWhy[sd];
+      if (!e) return (sd === 'left' ? '左' : '右') + ' —';
+      const f = (k, ok) => (ok ? '' : '✗') + k;
+      const r = c ? ' 上/肩 ' + (c.rU == null ? '—' : c.rU.toFixed(2))
+                  + ' 前/校 ' + (c.rF == null ? '—' : c.rF.toFixed(2)) : '';
+      return (sd === 'left' ? '左' : '右') + ' \u039b' + track[sd].toFixed(1)
+           + ' ' + f('鏈', e.chain) + f('續', e.cont) + f('強', e.strong) + r;
+    });
+
+    // 先把每一列和它的高度排出來，再決定從哪裡開始畫。
+    // 原本直接從 y 往下排，在 y = 0.90×畫布高 的呼叫點會超出下緣 ——
+    // 被切掉的正好是最後一行，也就是最關鍵的那行證據。
+    const rows = [{ kind: 'scores', h: 18 }];
     if (why.length) {
-      ctx.fillStyle = '#fbbf24';
-      why.forEach((line, i) => ctx.fillText(line, cv.width / 2, y + 18 + i * 17));
-      // 軌跡確認不了是最難從外面看出原因的一種 —— 把證據攤開。
-      // 這一行是給開發者看的儀器，跟上面給玩家的提示分開。
-      const ev = SIDES.map((sd) => {
-        const e = evLast[sd], c = chainWhy[sd];
-        if (!e) return (sd === 'left' ? '左' : '右') + ' —';
-        const f = (k, ok) => (ok ? '' : '✗') + k;
-        const r = c ? ' 上/肩 ' + (c.rU == null ? '—' : c.rU.toFixed(2))
-                    + ' 前/校 ' + (c.rF == null ? '—' : c.rF.toFixed(2)) : '';
-        return (sd === 'left' ? '左' : '右') + ' Λ' + track[sd].toFixed(1)
-             + ' ' + f('鏈', e.chain) + f('續', e.cont) + f('強', e.strong) + r;
-      });
-      ctx.fillStyle = '#9aa3b2';
-      ctx.font = '400 11px ui-monospace,Menlo,monospace';
-      ev.forEach((line, i) =>
-        ctx.fillText(line, cv.width / 2, y + 18 + why.length * 17 + i * 14));
-      ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+      for (const t of why) rows.push({ kind: 'hint', text: t, h: 17 });
+      for (const t of ev)  rows.push({ kind: 'ev',   text: t, h: 14 });
     } else {
-      ctx.fillStyle = '#9aa3b2';
-      ctx.fillText('肩膀、手肘、手腕三點都要進畫面，掌刀才算得出來',
-                   cv.width / 2, y + 18);
+      rows.push({ kind: 'hint', h: 17,
+                  text: '肩膀、手肘、手腕三點都要進畫面，掌刀才算得出來' });
     }
+    // 最後一列的基線 = 起點 + 前面所有列的高度
+    const above = rows.slice(0, -1).reduce((a, r) => a + r.h, 0);
+    let cy = Math.min(y, cv.height - 6 - above);
+
+    for (const r of rows) {
+      if (r.kind === 'scores') {
+        ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+        ctx.textAlign = 'left';
+        let x = cv.width / 2 - 150;
+        for (const side of SIDES) {
+          ctx.fillStyle = '#9aa3b2';
+          ctx.fillText(side === 'left' ? '左' : '右', x, cy);
+          x += 18;
+          for (const part of ARM) {
+            const k = kp[side + '_' + part];
+            const need = part === 'elbow' ? MIN_SCORE * ELBOW_SCORE_MUL : MIN_SCORE;
+            const sc = k ? k.score : 0;
+            ctx.fillStyle = sc >= need ? '#4ade80' : '#f87171';
+            ctx.fillText({ shoulder: '肩', elbow: '肘', wrist: '腕' }[part]
+                         + ' ' + sc.toFixed(2), x, cy);
+            x += 52;
+          }
+          x += 14;
+        }
+        ctx.textAlign = 'center';
+      } else if (r.kind === 'hint') {
+        ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
+        ctx.fillStyle = why.length ? '#fbbf24' : '#9aa3b2';
+        ctx.fillText(r.text, cv.width / 2, cy);
+      } else {
+        ctx.font = '400 11px ui-monospace,Menlo,monospace';
+        ctx.fillStyle = '#9aa3b2';
+        ctx.fillText(r.text, cv.width / 2, cy);
+      }
+      cy += r.h;
+    }
+    ctx.font = '400 12px -apple-system,"PingFang TC",sans-serif';
   }
 
   // 把模型輸出的 17 個點原封不動畫出來 —— 不過門檻、不經穩定化。
@@ -1510,6 +1553,12 @@
   // 不必等校正 —— 而且少了它，光靠「上臂/前臂比例」擋不住配錯的手肘：
   // 錯配出來的鏈比例可能剛好落在合理範圍內，只有絕對尺度看得出不對。
   const UPPER_VS_SHOULDER_HI = 1.5;
+  // 前臂相對肩寬的上界。真實比值約 0.63，投影只會更短，1.6 留足餘裕。
+  const FORE_VS_SHOULDER_HI = 1.6;
+  // 收校正樣本時的合理範圍（下界只用在「要不要採信這個樣本」，
+  // 不用在「這條鏈成不成立」—— 手伸直朝鏡頭時下界會誤擋，但那種影格
+  // 本來就不該拿來估計真實長度）。
+  const FORE_VS_SHOULDER_LO = 0.30;
   // 前臂投影短於這個比例時，拿它當方向來源不可靠（手伸直指向鏡頭的情形）
   // —— 改用肩膀→手腕，同一條已驗證的鏈，基線長得多也穩得多
   const DIR_MIN_FOREARM = 0.3;
@@ -1565,7 +1614,9 @@
   // 每個量都是「滾動估計器 + 帶遲滯的變化偵測」，差別只在波動性。
   const SLASH_FOREARM = 1.0;   // 一刀至少要掃過一個前臂長
   const SLASH_NOISE_MUL = 6;   // 而且至少要是雜訊地板的這麼多倍
-  const SPEED_FOREARM = 16;    // 手腕極速約 16 個前臂長／秒（≈4 m/s）
+  // 手腕極速。原本 16 個前臂長／秒 = 恰好 4.0 m/s，而人全力揮擊就是 3–4 m/s
+  // —— 等於門檻壓在真實動作上，沒有任何餘裕。提到 28 留一倍。
+  const SPEED_FOREARM = 28;
   const SCORE_MIN = 0.12, SCORE_MAX = 0.32;
   // 相機剛開、人還在看畫面的那幾秒，是真正的靜止窗 ——
   // 他得先把手移到按鈕上才會開始動，所以這段時間量到的位移就是雜訊地板。
@@ -1925,6 +1976,42 @@
       }
     }
     if (any) { stats.detFrames++; lastBladeAt = now; }
+    if (!any) logNoBlade(now);
+  }
+
+  // 兩隻手都沒有刀的時候，每秒把完整狀態印一次。
+  //
+  // 為什麼是 console 不是畫布：畫布有下緣、有寬度，排版錯了就把最關鍵的
+  // 那一行切掉（已經發生過一次），而且使用者沒辦法把數字複製給我。
+  // console 沒有版面問題，一行就是一行。
+  let lastDiagAt = 0;
+  function logNoBlade(now) {
+    if (now - lastDiagAt < 1000) return;
+    lastDiagAt = now;
+    const raw = {};
+    if (lastPose) for (const k of lastPose.keypoints) if (k.name) raw[k.name] = k;
+    const num = (v, d) => (v == null ? '—' : v.toFixed(d));
+    const row = (sd) => {
+      const e = evLast[sd] || {}, c = chainWhy[sd] || {};
+      const sc = (nm) => raw[sd + '_' + nm] ? raw[sd + '_' + nm].score.toFixed(2) : '—';
+      return sd.padEnd(5)
+        + ' \u039b=' + num(track[sd], 2) + (confirmed[sd] ? '✓' : ' ')
+        + ' 鏈=' + (e.chain === undefined ? '—' : e.chain)
+        + ' 續=' + (e.cont === undefined ? '—' : e.cont) + '(' + num(e.contVal, 2) + ')'
+        + ' 強=' + (e.strong === undefined ? '—' : e.strong)
+        + ' | 上臂=' + num(c.upper, 0) + ' 前臂=' + num(c.fore, 0)
+        + ' 肩寬=' + num(c.shoulderW, 0)
+        + ' 上/肩=' + num(c.rU, 2) + '(>1.5擋)'
+        + ' 前/校=' + num(c.rF, 2) + '(>2.2擋)'
+        + ' | 肩' + sc('shoulder') + ' 肘' + sc('elbow') + ' 腕' + sc('wrist')
+        + ' | ' + (noBlade[sd] || '—');
+    };
+    console.log('[無刀] 門檻=' + MIN_SCORE.toFixed(2)
+      + ' 肘門檻=' + (MIN_SCORE * ELBOW_SCORE_MUL).toFixed(2)
+      + ' 校正前臂=' + (calib ? calib.forearm.toFixed(0) : '—')
+      + ' 畫布=' + cv.width + 'x' + cv.height
+      + ' 影像=' + video.videoWidth + 'x' + video.videoHeight
+      + '\n  ' + row('left') + '\n  ' + row('right'));
   }
 
   // 推論迴圈：唯一會 await 的地方，不在 rAF 裡
