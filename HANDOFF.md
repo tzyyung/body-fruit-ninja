@@ -3,7 +3,8 @@
 最後更新 2026-10-09。commit `057d2fe`。
 
 這份給下一個接手的人（或 compact 之後的我）。
-**設計細節看 `mvp/README.md`，工作規範看 `CLAUDE.md`，這份只寫「現在在哪、下一步做什麼」。**
+**方法與理論看 `docs/METHOD.md`，操作細節看 `mvp/README.md`，
+工作規範看 `CLAUDE.md`，這份只寫「現在在哪、下一步做什麼」。**
 
 ---
 
