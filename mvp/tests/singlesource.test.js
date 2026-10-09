@@ -52,7 +52,7 @@ section('關鍵判斷只能有一個入口');
 // 這些函式如果被繞過去（有人自己手刻一份同樣的判斷），
 // 規則就只會生效一部分，而測試照樣綠。
 for (const f of ['bodyScale', 'scoreNeed', 'chainOK', 'armsDistinct',
-                 'weakerArm', 'palmPoint', 'shoulderWidth', 'continuity', 'dropOffFrame']) {
+                 'weakerArm', 'palmPoint', 'shoulderWidth', 'continuity', 'dropOffFrame', 'activeSide']) {
   t('函式 ' + f + ' 只定義一次',
     count('function ' + f + '('), 1);
 }
