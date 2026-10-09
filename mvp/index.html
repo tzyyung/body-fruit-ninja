@@ -624,20 +624,26 @@
   // 這三點是不是同一隻手臂？
   // 人的上臂與前臂長度相近，比例差太多就表示配錯了。
   // 有校正值的話再多一道：前臂長度不該偏離量到的身形太多。
+  // 只檢查上界，不檢查下界。
+  //
+  // 透視投影只會讓線段「變短」，不會變長 —— 所以「太長」一定是配錯手臂，
+  // 但「太短」可能只是手伸直指向鏡頭。原本有三個下界檢查
+  // （upper<4、ratio 下限、fore/前臂 下限），手一伸直全部誤擋，
+  // 而那正是切水果最常用的動作。
+  //
+  // 擋掉錯配的工作改由上界 + armsDistinct（兩條鏈不能共用點）負責。
+  // 實測先前漏掉的「手肘是另一隻手的」案例（上臂 230px / 肩寬 120px = 1.9）
+  // 單靠上界就擋得下來。
   function chainOK(sh, eb, wr, shoulderW) {
     const upper = Math.hypot(sh.x - eb.x, sh.y - eb.y);
     const fore  = Math.hypot(eb.x - wr.x, eb.y - wr.y);
-    if (upper < 4 || fore < 4) return false;
-    const ratio = fore / upper;
-    if (ratio < CHAIN_LO || ratio > CHAIN_HI) return false;
-    if (shoulderW > 4) {
-      const rel = upper / shoulderW;
-      if (rel < UPPER_VS_SHOULDER_LO || rel > UPPER_VS_SHOULDER_HI) return false;
-    }
-    if (calib && calib.forearm > 4) {
-      const rel = fore / calib.forearm;
-      if (rel < 0.45 || rel > 2.2) return false;
-    }
+    // 只用「單一線段的絕對長度上界」。
+    //
+    // 不能用「前臂/上臂的比值」—— 投影會獨立影響兩段：手肘收在身側、
+    // 前臂橫向伸出時，上臂縮成 10px 而前臂 70px，比值 7.0，
+    // 但那是完全正常的姿勢。上界只對單一線段成立，對比值不成立。
+    if (shoulderW > 4 && upper / shoulderW > UPPER_VS_SHOULDER_HI) return false;
+    if (calib && calib.forearm > 4 && fore / calib.forearm > 2.2) return false;
     return true;
   }
 
@@ -675,10 +681,23 @@
       // 錯的方向比沒有方向糟糕得多：沒方向只是少 10cm 偏移，
       // 錯方向會讓刀刃指到完全不相干的位置。
       if (eb && sh && chainOK(sh, eb, wrist, shoulderWidth(kp))) {
-        stats.forearm = Math.max(stats.forearm,
-                                 Math.hypot(wrist.x - eb.x, wrist.y - eb.y));
-        const x = wrist.x + (wrist.x - eb.x) * K;
-        const y = wrist.y + (wrist.y - eb.y) * K;
+        const foreLen = Math.hypot(wrist.x - eb.x, wrist.y - eb.y);
+        stats.forearm = Math.max(stats.forearm, foreLen);
+
+        // 方向：前臂投影夠長就用前臂（最準）；手伸直朝向鏡頭時前臂縮成
+        // 幾個像素、方向全是雜訊，改用肩膀→手腕 —— 同一條已驗證的鏈，
+        // 基線長得多。（先前反對用肩膀，反對的是「配到另一隻手的肩膀」，
+        // 鏈驗證過之後就不是那個問題了。）
+        const ref = calib && calib.forearm > 4 ? calib.forearm : px(0.09);
+        const useElbow = foreLen >= ref * DIR_MIN_FOREARM;
+        const ax = useElbow ? eb.x : sh.x, ay = useElbow ? eb.y : sh.y;
+        const len = Math.hypot(wrist.x - ax, wrist.y - ay) || 1;
+
+        // 位移量用「投影後的前臂長」而不是校正值 ——
+        // 手朝鏡頭時真實的 10cm 在畫面上本來就該縮短，縮到 0 是對的
+        const off = foreLen * K;
+        const x = wrist.x + (wrist.x - ax) / len * off;
+        const y = wrist.y + (wrist.y - ay) / len * off;
         return { bx:x, by:y, tx:x, ty:y, pad: px(PALM_PAD) };
       }
       // 鏈不成立 → 沒有刀。不做「退化成手腕單點」。
@@ -1531,11 +1550,13 @@
   // 肩→肘→腕必須是同一條鏈。人的前臂與上臂長度相近，
   // 透視會讓比例偏離，但不會差到這個範圍外。
   // 比例不合就表示這三點不是同一隻手臂（單手時模型常把左右配錯）。
-  const CHAIN_LO = 0.55, CHAIN_HI = 1.8;
   // 上臂約 30cm、肩寬約 40cm。肩寬是當下這一幀就有的尺度參考，
   // 不必等校正 —— 而且少了它，光靠「上臂/前臂比例」擋不住配錯的手肘：
   // 錯配出來的鏈比例可能剛好落在合理範圍內，只有絕對尺度看得出不對。
-  const UPPER_VS_SHOULDER_LO = 0.35, UPPER_VS_SHOULDER_HI = 1.5;
+  const UPPER_VS_SHOULDER_HI = 1.5;
+  // 前臂投影短於這個比例時，拿它當方向來源不可靠（手伸直指向鏡頭的情形）
+  // —— 改用肩膀→手腕，同一條已驗證的鏈，基線長得多也穩得多
+  const DIR_MIN_FOREARM = 0.3;
 
   // ── 校正 ──
   // 原本所有門檻都是用「畫面寬的比例」表示的，那已經比寫死像素好，
